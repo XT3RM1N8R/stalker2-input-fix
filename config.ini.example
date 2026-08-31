@@ -1,0 +1,8 @@
+# ============================================================================
+# CONFIGURATION FILE TEMPLATE
+# ============================================================================
+# Copy this file to "config.ini" and update the paths below to match your system.
+# Git will automatically ignore "config.ini" so your personal paths stay hidden.
+
+# The absolute path to your Stalker 2 Win64 Binaries folder
+GAME_PATH=C:\Program Files (x86)\Steam\steamapps\common\S.T.A.L.K.E.R. 2 Heart of Chornobyl\Stalker2\Binaries\Win64

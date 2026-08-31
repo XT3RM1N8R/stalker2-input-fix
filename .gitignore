@@ -1,0 +1,16 @@
+*.obj
+*.exp
+*.lib
+*.exe
+temp.cpp
+test*.cpp
+preprocessed.txt
+extracted.txt
+gameinput.dll
+build/*
+!build/.gitkeep
+
+# Local config
+config.ini
+
+GEMINI.md
