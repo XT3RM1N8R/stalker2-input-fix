@@ -39,3 +39,8 @@ Unreal Engine continues to process background inputs even when Alt-Tabbed. Rathe
 
 ### DX12 Flip Model and Steam Overlay IPC Leakage
 True Exclusive Fullscreen is largely deprecated in DirectX 12. Unreal Engine 5 uses DXGI Flip Model to present HDR frames, which behaves fundamentally like a Borderless Window. When the user Alt-Tabs out, the game loses focus but does not minimize. Because the swapchain remains alive in the background, steam.exe continues to route physical controller inputs directly into the steamwebhelper.exe CEF process via an external IPC pipe. Consequently, the Steam Overlay will continue to navigate in the background even when the game is tabbed out. Because this input routing happens entirely outside the game process, our DLL cannot intercept it. Attempting to hook RegisterRawInputDevices to manipulate OS structs will cause swapchain corruption.
+
+### Hardware Identification and Handle Lifecycle
+When intercepting Windows Kernel file I/O (`CreateFile` and `ReadFile`), two strict rules must be followed:
+1. **Precise Filtering:** Identifying hardware paths solely by Vendor ID (`vid_054c`) is forbidden, as it will indiscriminately catch TVs and headsets, corrupting media streams. Always combine VID with exact DualSense/DualShock Product IDs (`pid_0ce6`, `pid_0df2`, etc.).
+2. **Handle Lifecycle (Avoid Reuse Leaks):** Because Windows aggressively recycles handle IDs, tracking `HANDLE` pointers requires absolute lifecycle management. You must hook `CloseHandle` to instantly purge dropped handles from internal watch-lists, or the OS will reuse the handle ID for media files, causing the proxy to overwrite video/audio streams with joystick telemetry.

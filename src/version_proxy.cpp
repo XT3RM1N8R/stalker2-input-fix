@@ -1,6 +1,6 @@
 // ============================================================================
 // STALKER 2: VERSION.DLL GLOBAL PROXY & XINPUT/RAWINPUT FIREWALL
-// Architecture: MASM Naked Assembly Forwarder + MinHook Background Thread
+// Strategy: MASM Naked Assembly Forwarder + MinHook Background Thread
 // ============================================================================
 // This DLL masquerades as the system 'version.dll' to bypass UE5's SetDefaultDllDirectories
 // anti-hijacking mechanics. It uses MASM naked jumps to perfectly forward all 17 
@@ -15,7 +15,7 @@
 #include <stdio.h>
 #include "MinHook.h"
 #include <intrin.h>
-#pragma intrinsic(_ReturnAddress)
+#pragma intrinsic(_ReturnAddress) // Force compiler to use intrinsic version of _ReturnAddress.
 
 #include "version_pointers.h"
 
@@ -35,67 +35,73 @@ public:
 };
 class CCallbackImpl : public CCallbackBase {
 public:
-    void* m_pObj; void (*m_Func)(void*, void*);
-    virtual void Run(void* pvParam) override { m_Func(m_pObj, pvParam); }
-    virtual void Run(void* pvParam, bool bIOFailure, HSteamPipe hSteamPipe) override { m_Func(m_pObj, pvParam); }
-    virtual int GetCallbackSizeBytes() override { return sizeof(GameOverlayActivated_t); }
-    struct GameOverlayActivated_t { uint8_t m_bActive; };
+    void* m_pObj; void (*m_Func)(void*, void*); // Pointers to the instance object and the function to handle the callback.
+    virtual void Run(void* pvParam) override { m_Func(m_pObj, pvParam); } // Execute the callback by invoking the stored function.
+    virtual void Run(void* pvParam, bool bIOFailure, HSteamPipe hSteamPipe) override { m_Func(m_pObj, pvParam); } // Overloaded version of Run; currently ignores bIOFailure and hSteamPipe.
+    virtual int GetCallbackSizeBytes() override { return sizeof(GameOverlayActivated_t); } // Return the size of the specifically handled overlay activated structure.
+    struct GameOverlayActivated_t { uint8_t m_bActive; }; // Structure storing whether the game overlay is active (boolean-like byte).
 };
 typedef void (__cdecl *SteamAPI_RegisterCallback_t)(CCallbackBase* pCallback, int iCallback);
 typedef void (__cdecl *SteamAPI_UnregisterCallback_t)(CCallbackBase* pCallback);
 #pragma pack(pop)
 
-std::atomic<bool> g_bIsSteamOverlayActive(false);
-std::atomic<bool> g_bIsGameInFocus(true);
+std::atomic<bool> g_bIsSteamOverlayActive(false); // Thread-safe flag indicating if the Steam overlay is open.
+std::atomic<bool> g_bIsGameInFocus(true); // Thread-safe flag indicating if the game window is currently focused.
 
-bool ShouldBlockInput() {
+bool ShouldBlockInput() { // Function to determine if inputs should be blocked.
+    // Return true if either the overlay is active or the game is out of focus.
     return g_bIsSteamOverlayActive.load(std::memory_order_relaxed) || !g_bIsGameInFocus.load(std::memory_order_relaxed);
 }
 
 // ============================================================================
 // STEAM OVERLAY LISTENER
 // Purpose: Hooks into the Steam API to detect when Shift+Tab is pressed.
-// Note: We intentionally leak this object on DLL_PROCESS_DETACH to prevent 
-// crash-on-exit race conditions with steam_api64.dll.
+// This object is intentionally leaked on DLL_PROCESS_DETACH because cleaning it up
+// while steam_api64.dll is unloading causes a race condition and crashes the game on exit.
 // ============================================================================
-class CSteamOverlayListener {
+class CSteamOverlayListener { // Class for managing Steam overlay events.
 public:
-    CSteamOverlayListener() {
-        m_CallbackImpl.m_pObj = this;
-        m_CallbackImpl.m_nCallbackFlags = 0; // CRITICAL: Must be 0 so Steam doesn't ignore it
-        m_CallbackImpl.m_iCallback = 331;
-        m_CallbackImpl.m_Func = [](void* obj, void* param) {
+    CSteamOverlayListener() { // Constructor.
+        m_CallbackImpl.m_pObj = this; // Set the object pointer to this instance.
+        // Initialize flags to 0. If uninitialized garbage memory is here, 
+        // the Steam API silently ignores the callback registration.
+        m_CallbackImpl.m_nCallbackFlags = 0; // Explicitly set callback flags to 0.
+        m_CallbackImpl.m_iCallback = 331; // Set callback ID for GameOverlayActivated.
+        m_CallbackImpl.m_Func = [](void* obj, void* param) { // Define a lambda as the callback handler function.
+            // Cast the void pointers to appropriate types and invoke OnGameOverlayActivated.
             static_cast<CSteamOverlayListener*>(obj)->OnGameOverlayActivated(
                 static_cast<CCallbackImpl::GameOverlayActivated_t*>(param));
         };
         
-        HMODULE hSteam = GetModuleHandleA("steam_api64.dll");
-        if (hSteam) {
+        HMODULE hSteam = GetModuleHandleA("steam_api64.dll"); // Get a handle to the loaded steam_api64.dll module.
+        if (hSteam) { // Check if steam_api64.dll was successfully found.
+            // Retrieve the address of the SteamAPI_RegisterCallback export.
             auto reg = (SteamAPI_RegisterCallback_t)GetProcAddress(hSteam, "SteamAPI_RegisterCallback");
-            if (reg) reg(&m_CallbackImpl, m_CallbackImpl.m_iCallback);
+            if (reg) reg(&m_CallbackImpl, m_CallbackImpl.m_iCallback); // If found, register the callback with Steam.
             
-            FILE* f;
-            if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) {
-                fprintf(f, "Registered Steam Callback 331\n");
-                fclose(f);
+            FILE* f; // Declare a file pointer.
+            if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { // Try to open proxy_loaded.txt in append mode.
+                fprintf(f, "Registered Steam Callback 331\n"); // Log that the callback was registered.
+                fclose(f); // Close the log file.
             }
         }
     }
-    void OnGameOverlayActivated(CCallbackImpl::GameOverlayActivated_t* pCallback) {
+    void OnGameOverlayActivated(CCallbackImpl::GameOverlayActivated_t* pCallback) { // Handler for overlay state changes.
+        // Update the atomic flag for overlay state using memory_order_release.
         g_bIsSteamOverlayActive.store(pCallback->m_bActive != 0, std::memory_order_release);
         
-        FILE* f;
-        if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) {
-            fprintf(f, "OVERLAY TRIGGERED: %d\n", pCallback->m_bActive);
-            fclose(f);
+        FILE* f; // Declare a file pointer.
+        if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { // Try to open proxy_loaded.txt in append mode.
+            fprintf(f, "OVERLAY TRIGGERED: %d\n", pCallback->m_bActive); // Log the new overlay state.
+            fclose(f); // Close the log file.
         }
     }
-private:
-    CCallbackImpl m_CallbackImpl;
+private: // Private access modifier.
+    CCallbackImpl m_CallbackImpl; // The actual callback implementation object.
 };
 
-CSteamOverlayListener* g_pSteamListener = nullptr;
-std::once_flag g_SteamInitOnceFlag;
+CSteamOverlayListener* g_pSteamListener = nullptr; // Global pointer to the Steam overlay listener instance.
+std::once_flag g_SteamInitOnceFlag; // Once-flag to ensure the listener is initialized only a single time.
 
 // ============================================================================
 // STEAM CALLER WHITELIST (Trevigintuple Guard)
@@ -104,101 +110,108 @@ std::once_flag g_SteamInitOnceFlag;
 // Mechanism: Uses the CPU _ReturnAddress() to check if the caller lives inside
 // a known Steam DLL memory space.
 // ============================================================================
-void NeutralizeDualSensePacket(PBYTE buf, DWORD size);
-// Constructs a perfect, flawless hardware spoof that explicitly sets the Touchpad to "Not Touching",
-// neutralizes all sticks and buttons, and bypasses IOCP.
-void SynthesizeNeutralDualSensePacket(PBYTE buf, DWORD size) {
-    if (!buf || size < 64) return;
-    memset(buf, 0, size);
+void NeutralizeDualSensePacket(PBYTE buf, DWORD size); // Forward declaration of function to neutralize DualSense packets.
+// Constructs a flawless hardware spoof that explicitly sets the Touchpad to "Not Touching",
+// neutralizes all sticks and buttons, and provides proper IMU data to prevent NaN math.
+void SynthesizeNeutralDualSensePacket(PBYTE buf, DWORD size) { // Function to zero out or neutralize DualSense input.
+    if (!buf || size < 64) return; // If buffer is invalid or too small, abort synthesis.
+    memset(buf, 0, size); // Clear the entire buffer to zeroes.
     
     // USB Report ID
-    buf[0] = 0x01;
+    buf[0] = 0x01; // Set the report ID to 1 (standard DualSense USB report).
     
-    // Joysticks (Centered = 128)
-    buf[1] = 0x80; buf[2] = 0x80; buf[3] = 0x80; buf[4] = 0x80;
+    // Set joysticks to mechanical center (128). 
+    // Setting these to 0 would cause the camera/character to violently snap to the top-left.
+    buf[1] = 0x80; buf[2] = 0x80; buf[3] = 0x80; buf[4] = 0x80; // Assign 128 (0x80) to both X and Y axes of both sticks.
     
     // Triggers (Unpressed = 0)
-    buf[5] = 0x00; buf[6] = 0x00;
+    buf[5] = 0x00; buf[6] = 0x00; // Reset both trigger values to 0.
     
     // Sequence Counter
-    buf[7] = 0x00;
+    buf[7] = 0x00; // Set the sequence counter to 0.
     
-    // Buttons (Byte 8 = D-Pad and Shapes. 0x08 = D-Pad Neutral, Shapes unpressed)
-    // BUG FIX: I previously set buf[5] to 0x08 because I confused the DualSense layout 
-    // with the DualShock 4 layout. The DualSense puts triggers in bytes 5/6 and buttons in byte 8!
-    buf[8] = 0x08;
-    buf[9] = 0x00;
-    buf[10] = 0x00;
+    // DualSense maps buttons to byte 8 (unlike DualShock 4 which uses byte 5).
+    // 0x08 represents a neutral, unpressed D-Pad.
+    // If left as 0x00, the game interprets the D-Pad as being permanently held "UP".
+    buf[8] = 0x08; // Set D-Pad to neutral position.
+    buf[9] = 0x00; // Clear remaining main buttons.
+    buf[10] = 0x00; // Clear system/special buttons.
     
     // Gyroscope (Centered = 0)
     // buf[16] to buf[21] already 0 from memset
     
-    // Accelerometer (X, Y = 0. Z = 8192 for 1G Gravity to prevent NaN math)
-    // BUG FIX: Freefall (0G) causes Unreal Engine to compute NaN for orientation!
-    if (size >= 28) {
-        buf[26] = 0x00;
-        buf[27] = 0x20;
+    // Synthesize 1G of downward gravity on the Z-axis (8192 units).
+    // If we supply 0G (freefall) across all axes, Unreal Engine's IMU math 
+    // divides by zero, resulting in NaNs that violently snap the camera.
+    if (size >= 28) { // Make sure buffer is large enough for IMU values.
+        buf[26] = 0x00; // Accelerometer Z LSB.
+        buf[27] = 0x20; // 0x2000 = 8192 in little endian. Accelerometer Z MSB.
     }
     
-    // Touchpad 1 (Set to Not Touching, and mathematically centered at 960x540)
-    // BUG FIX: The previous pure-zero memset forced "Is Touching = Active" at coordinates 0,0 (Top Left).
-    if (size >= 37) {
-        buf[33] = 0x80; // Not Touching
+    // Touchpad 1 data.
+    if (size >= 37) { // Check if buffer includes touchpad data.
+        // We set the MSB (0x80) to indicate the finger is NOT touching the pad.
+        buf[33] = 0x80; 
+        
+        // As a fallback for lazy parsers that ignore the "Not Touching" bit,
+        // we explicitly set the coordinate to the physical center of the pad (960x540)
+        // instead of leaving it at 0,0 (Top-Left) which could cause UI glitches.
         buf[34] = 0xC0; // X Low
         buf[35] = 0xC3; // X High + Y Low
         buf[36] = 0x21; // Y High
     }
     
     // Touchpad 2
-    if (size >= 41) {
-        buf[37] = 0x80; // Not Touching
-        buf[38] = 0xC0; // X Low
-        buf[39] = 0xC3; // X High + Y Low
-        buf[40] = 0x21; // Y High
+    if (size >= 41) { // Check if buffer includes second touchpad data point.
+        buf[37] = 0x80; // Not Touching flag for second touchpad point.
+        buf[38] = 0xC0; // X Low for point 2.
+        buf[39] = 0xC3; // X High + Y Low for point 2.
+        buf[40] = 0x21; // Y High for point 2.
     }
 }
-bool IsCallerSteam(void* callerAddress) {
-    HMODULE hCaller = NULL;
+
+bool IsCallerSteam(void* callerAddress) { // Function to determine if a calling address belongs to Steam.
+    HMODULE hCaller = NULL; // Initialize module handle for the caller to NULL.
     // Returns FALSE if caller is unmapped JIT memory (e.g. Anti-Cheat/Mods)
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)callerAddress, &hCaller);
-    if (!hCaller) return false;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)callerAddress, &hCaller); // Try to get the module handle for the given caller address.
+    if (!hCaller) return false; // If no module was found (e.g., JIT code or invalid address), it's not Steam.
     
-    static HMODULE hOverlay = NULL;
-    static HMODULE hApi = NULL;
-    static HMODULE hClient = NULL;
-    static bool bInitialized = false;
+    static HMODULE hOverlay = NULL; // Static cache for the GameOverlayRenderer64 module handle.
+    static HMODULE hApi = NULL; // Static cache for the steam_api64 module handle.
+    static HMODULE hClient = NULL; // Static cache for the steamclient64 module handle.
+    static bool bInitialized = false; // Static flag to track if the handles have been cached.
     
-    if (hCaller == hOverlay || hCaller == hApi || (hClient && hCaller == hClient)) return true;
+    if (hCaller == hOverlay || hCaller == hApi || (hClient && hCaller == hClient)) return true; // Fast-path check: return true immediately if caller matches cached handles.
     
     // Cache miss handling: Only run GetModuleHandle once. If steamclient64.dll 
     // isn't injected into the game, we cache the NULL so we don't spam the OS.
-    if (!bInitialized) {
-        hOverlay = GetModuleHandleA("GameOverlayRenderer64.dll");
-        hApi = GetModuleHandleA("steam_api64.dll");
-        hClient = GetModuleHandleA("steamclient64.dll");
-        bInitialized = true;
+    if (!bInitialized) { // Check if we haven't initialized the cache yet.
+        hOverlay = GetModuleHandleA("GameOverlayRenderer64.dll"); // Look up overlay DLL.
+        hApi = GetModuleHandleA("steam_api64.dll"); // Look up steam API DLL.
+        hClient = GetModuleHandleA("steamclient64.dll"); // Look up steam client DLL.
+        bInitialized = true; // Mark as initialized so we don't look up again.
     }
     
-    return (hCaller == hOverlay || hCaller == hApi || (hClient && hCaller == hClient));
+    return (hCaller == hOverlay || hCaller == hApi || (hClient && hCaller == hClient)); // Check one last time with freshly cached values.
 }
 
 
 
 // --- Hook Typedefs ---
 typedef UINT (WINAPI *GetRawInputData_t)(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader);
-GetRawInputData_t real_GetRawInputData = nullptr;
+GetRawInputData_t real_GetRawInputData = nullptr; // Function pointer to store the original GetRawInputData.
 
 typedef DWORD (WINAPI *XInputGetState_t)(DWORD dwUserIndex, void* pState);
-XInputGetState_t real_XInputGetState = nullptr;
+XInputGetState_t real_XInputGetState = nullptr; // Function pointer to store the original XInputGetState.
 
 typedef DWORD (WINAPI *XInputSetState_t)(DWORD dwUserIndex, void* pVibration);
-XInputSetState_t real_XInputSetState = nullptr;
+XInputSetState_t real_XInputSetState = nullptr; // Function pointer to store the original XInputSetState.
 
 typedef DWORD (WINAPI *XInputGetKeystroke_t)(DWORD dwUserIndex, DWORD dwReserved, void* pKeystroke);
-XInputGetKeystroke_t real_XInputGetKeystroke = nullptr;
+XInputGetKeystroke_t real_XInputGetKeystroke = nullptr; // Function pointer to store the original XInputGetKeystroke.
 
 typedef DWORD (WINAPI *XInputGetStateEx_t)(DWORD dwUserIndex, void* pState);
-XInputGetStateEx_t real_XInputGetStateEx = nullptr;
+XInputGetStateEx_t real_XInputGetStateEx = nullptr; // Function pointer to store the original XInputGetStateEx.
 
 
 // ============================================================================
@@ -210,52 +223,52 @@ XInputGetStateEx_t real_XInputGetStateEx = nullptr;
 
 #include <unordered_set>
 #include <shared_mutex>
-std::unordered_set<HANDLE> g_RawInputSonyHandles;
-std::unordered_set<HANDLE> g_RawInputNonSonyHandles;
-std::shared_mutex g_RawInputMutex;
+std::unordered_set<HANDLE> g_RawInputSonyHandles; // Set tracking handles known to be Sony controllers.
+std::unordered_set<HANDLE> g_RawInputNonSonyHandles; // Set tracking handles known NOT to be Sony controllers.
+std::shared_mutex g_RawInputMutex; // Mutex protecting the raw input handle sets.
 
-bool IsRawInputSony(HANDLE hDevice) {
-    if (!hDevice) return false;
+bool IsRawInputSony(HANDLE hDevice) { // Function to determine if a raw input device is a Sony controller.
+    if (!hDevice) return false; // If the device handle is null, it's not a valid device.
     
-    {
-        std::shared_lock<std::shared_mutex> lock(g_RawInputMutex);
-        if (g_RawInputSonyHandles.find(hDevice) != g_RawInputSonyHandles.end()) return true;
-        if (g_RawInputNonSonyHandles.find(hDevice) != g_RawInputNonSonyHandles.end()) return false;
-    }
+    { // Create a scope for the reader lock.
+        std::shared_lock<std::shared_mutex> lock(g_RawInputMutex); // Acquire a shared lock for reading.
+        if (g_RawInputSonyHandles.find(hDevice) != g_RawInputSonyHandles.end()) return true; // If found in Sony set, return true.
+        if (g_RawInputNonSonyHandles.find(hDevice) != g_RawInputNonSonyHandles.end()) return false; // If found in non-Sony set, return false.
+    } // Release shared lock.
     
-    UINT size = 0;
-    GetRawInputDeviceInfoA(hDevice, RIDI_DEVICENAME, nullptr, &size);
-    if (size > 0 && size < 1024) {
-        char name[1024] = {0};
-        if (GetRawInputDeviceInfoA(hDevice, RIDI_DEVICENAME, name, &size) != (UINT)-1) {
-            std::string s(name);
-            for (auto& c : s) c = tolower(c);
+    UINT size = 0; // Variable to hold the size of the device name.
+    GetRawInputDeviceInfoA(hDevice, RIDI_DEVICENAME, nullptr, &size); // Query the required size for the device name.
+    if (size > 0 && size < 1024) { // Verify the size is sensible before allocating on stack.
+        char name[1024] = {0}; // Buffer for the device name.
+        if (GetRawInputDeviceInfoA(hDevice, RIDI_DEVICENAME, name, &size) != (UINT)-1) { // Actually retrieve the device name.
+            std::string s(name); // Convert to std::string for easier processing.
+            for (auto& c : s) c = tolower(c); // Convert the entire string to lowercase for case-insensitive matching.
             
-            std::unique_lock<std::shared_mutex> lock(g_RawInputMutex);
-            if (s.find("vid_054c") != std::string::npos) {
-                g_RawInputSonyHandles.insert(hDevice);
-                return true;
-            } else {
-                g_RawInputNonSonyHandles.insert(hDevice);
-                return false;
+            std::unique_lock<std::shared_mutex> lock(g_RawInputMutex); // Acquire an exclusive lock to update caches.
+            if (s.find("vid_054c") != std::string::npos) { // Check if the device name contains Sony's Vendor ID.
+                g_RawInputSonyHandles.insert(hDevice); // Add to known Sony handles.
+                return true; // Return true as it's a Sony device.
+            } else { // Otherwise, it's not a Sony device.
+                g_RawInputNonSonyHandles.insert(hDevice); // Add to known non-Sony handles.
+                return false; // Return false.
             }
         }
     }
-    return false;
+    return false; // Default to false if we couldn't determine the device type.
 }
 
-UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader) {
-    UINT result = real_GetRawInputData(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
-    if (result != (UINT)-1 && pData && uiCommand == RID_INPUT && ShouldBlockInput()) {
-        RAWINPUT* raw = (RAWINPUT*)pData;
-        if (raw->header.dwType == RIM_TYPEHID) {
-            DWORD reportSize = raw->data.hid.dwSizeHid * raw->data.hid.dwCount;
-            if ((reportSize == 64 || reportSize == 78) && IsRawInputSony(raw->header.hDevice)) {
-                SynthesizeNeutralDualSensePacket((PBYTE)raw->data.hid.bRawData, reportSize);
+UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader) { // Intercept GetRawInputData calls.
+    UINT result = real_GetRawInputData(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader); // Call the original GetRawInputData first to fill the buffer.
+    if (result != (UINT)-1 && pData && uiCommand == RID_INPUT && ShouldBlockInput()) { // Check if the read succeeded, we have data, we're reading input, and we should be blocking.
+        RAWINPUT* raw = (RAWINPUT*)pData; // Cast the raw data to a RAWINPUT structure.
+        if (raw->header.dwType == RIM_TYPEHID) { // Verify this is a Human Interface Device report.
+            DWORD reportSize = raw->data.hid.dwSizeHid * raw->data.hid.dwCount; // Calculate the total byte size of the HID report.
+            if ((reportSize == 64 || reportSize == 78) && IsRawInputSony(raw->header.hDevice)) { // DualSense reports are usually 64 or 78 bytes. Check size and Sony vendor.
+                SynthesizeNeutralDualSensePacket((PBYTE)raw->data.hid.bRawData, reportSize); // Overwrite the report with a neutral (zero-state) packet.
             }
         }
     }
-    return result;
+    return result; // Return the (potentially modified) result to the caller.
 }
 
 // ============================================================================
@@ -263,105 +276,114 @@ UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pDa
 // Purpose: Block synthesized Desktop Configuration inputs from Steam
 // ============================================================================
 
-void NullifyMessage(LPMSG lpMsg) {
-    if (lpMsg && ShouldBlockInput()) {
-        if ((lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) ||
-            (lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) ||
-            (lpMsg->message == WM_INPUT)) {
-            lpMsg->message = WM_NULL;
+// Prevent Steam's global "Desktop Configuration" from synthesizing fake Windows Keyboard events
+// when the overlay is active.
+void NullifyMessage(LPMSG lpMsg) { // Function to zero out Windows messages if blocking is active.
+    if (lpMsg && ShouldBlockInput()) { // Check if the message pointer is valid and input should be blocked.
+        if ((lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || // Check if it's a keyboard message.
+            (lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || // Check if it's a mouse message.
+            (lpMsg->message == WM_INPUT)) { // Check if it's a raw input message.
+            lpMsg->message = WM_NULL; // Change the message type to WM_NULL so the game ignores it.
         }
     }
 }
 
 typedef BOOL (WINAPI *PeekMessageW_t)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg);
-PeekMessageW_t real_PeekMessageW = nullptr;
-BOOL WINAPI Hook_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
-    BOOL result = real_PeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (result) NullifyMessage(lpMsg);
-    return result;
+PeekMessageW_t real_PeekMessageW = nullptr; // Store the original PeekMessageW pointer.
+BOOL WINAPI Hook_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) { // Intercept PeekMessageW.
+    BOOL result = real_PeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg); // Call the original PeekMessageW.
+    if (result) NullifyMessage(lpMsg); // If a message was retrieved, try to nullify it if necessary.
+    return result; // Return the result of PeekMessageW.
 }
 
 typedef BOOL (WINAPI *PeekMessageA_t)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg);
-PeekMessageA_t real_PeekMessageA = nullptr;
-BOOL WINAPI Hook_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
-    BOOL result = real_PeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (result) NullifyMessage(lpMsg);
-    return result;
+PeekMessageA_t real_PeekMessageA = nullptr; // Store the original PeekMessageA pointer.
+BOOL WINAPI Hook_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) { // Intercept PeekMessageA.
+    BOOL result = real_PeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg); // Call original PeekMessageA.
+    if (result) NullifyMessage(lpMsg); // Check if a message was retrieved, then nullify it if necessary.
+    return result; // Return the potentially modified result.
 }
 
 typedef BOOL (WINAPI *GetMessageW_t)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax);
-GetMessageW_t real_GetMessageW = nullptr;
-BOOL WINAPI Hook_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
-    BOOL result = real_GetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (result != -1 && result != 0) NullifyMessage(lpMsg);
-    return result;
+GetMessageW_t real_GetMessageW = nullptr; // Store the original GetMessageW pointer.
+BOOL WINAPI Hook_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) { // Intercept GetMessageW.
+    BOOL result = real_GetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax); // Call original GetMessageW.
+    if (result != -1 && result != 0) NullifyMessage(lpMsg); // If we successfully got a message (not an error or WM_QUIT), nullify it if necessary.
+    return result; // Return the potentially modified result.
 }
 
 typedef BOOL (WINAPI *GetMessageA_t)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax);
-GetMessageA_t real_GetMessageA = nullptr;
-BOOL WINAPI Hook_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
-    BOOL result = real_GetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (result != -1 && result != 0) NullifyMessage(lpMsg);
-    return result;
+GetMessageA_t real_GetMessageA = nullptr; // Store the original GetMessageA pointer.
+BOOL WINAPI Hook_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) { // Intercept GetMessageA.
+    BOOL result = real_GetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax); // Call original GetMessageA.
+    if (result != -1 && result != 0) NullifyMessage(lpMsg); // Check if a message was retrieved successfully and nullify it if needed.
+    return result; // Return the potentially modified result.
 }
 
 typedef LRESULT (WINAPI *DispatchMessageW_t)(const MSG* lpMsg);
-DispatchMessageW_t real_DispatchMessageW = nullptr;
-LRESULT WINAPI Hook_DispatchMessageW(const MSG* lpMsg) {
-    if (lpMsg && ShouldBlockInput()) {
-        if ((lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) ||
-            (lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) ||
-            (lpMsg->message == WM_INPUT)) {
-            return 0;
+DispatchMessageW_t real_DispatchMessageW = nullptr; // Store the original DispatchMessageW pointer.
+LRESULT WINAPI Hook_DispatchMessageW(const MSG* lpMsg) { // Intercept DispatchMessageW.
+    if (lpMsg && ShouldBlockInput()) { // Check if we have a message and we should be blocking.
+        if ((lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || // Check if message is a keyboard event.
+            (lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || // Check if message is a mouse event.
+            (lpMsg->message == WM_INPUT)) { // Check if message is raw input.
+            return 0; // Return 0 to indicate the message was "processed" and should not be dispatched.
         }
     }
-    return real_DispatchMessageW(lpMsg);
+    return real_DispatchMessageW(lpMsg); // Otherwise, forward to the real DispatchMessageW.
 }
 
 typedef LRESULT (WINAPI *DispatchMessageA_t)(const MSG* lpMsg);
-DispatchMessageA_t real_DispatchMessageA = nullptr;
-LRESULT WINAPI Hook_DispatchMessageA(const MSG* lpMsg) {
-    if (lpMsg && ShouldBlockInput()) {
-        if ((lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) ||
-            (lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) ||
-            (lpMsg->message == WM_INPUT)) {
-            return 0;
+DispatchMessageA_t real_DispatchMessageA = nullptr; // Store the original DispatchMessageA pointer.
+LRESULT WINAPI Hook_DispatchMessageA(const MSG* lpMsg) { // Intercept DispatchMessageA.
+    if (lpMsg && ShouldBlockInput()) { // Check if message pointer is valid and input should be blocked.
+        if ((lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || // Is it a keyboard message?
+            (lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || // Is it a mouse message?
+            (lpMsg->message == WM_INPUT)) { // Is it a raw input message?
+            return 0; // Drop the message by returning 0.
         }
     }
-    return real_DispatchMessageA(lpMsg);
+    return real_DispatchMessageA(lpMsg); // Otherwise, forward to the real DispatchMessageA.
 }
+// ============================================================================
+// ============================================================================
 // ============================================================================
 // XINPUT INTERCEPTOR
 // ============================================================================
-DWORD WINAPI Hook_XInputGetState(DWORD dwUserIndex, void* pState) {
-    DWORD res = real_XInputGetState(dwUserIndex, pState);
-    if (res == ERROR_SUCCESS && pState && ShouldBlockInput()) {
-        memset(pState, 0, 16);
+
+// Strictly wipe the state memory when blocking input. 
+// If we just return success without zeroing, Unreal Engine thinks the last pressed button is permanently stuck down.
+DWORD WINAPI Hook_XInputGetState(DWORD dwUserIndex, void* pState) { // Intercept XInputGetState.
+    DWORD res = real_XInputGetState(dwUserIndex, pState); // Retrieve the real controller state.
+    if (res == ERROR_SUCCESS && pState && ShouldBlockInput()) { // If successful and we have state, check if we should block.
+        memset(pState, 0, 16); // Wipe the XINPUT_STATE struct (16 bytes) to clear all buttons and axes.
     }
-    return res;
+    return res; // Return the success code to fake that a controller is connected but neutral.
 }
 
-DWORD WINAPI Hook_XInputSetState(DWORD dwUserIndex, void* pVibration) {
-    if (ShouldBlockInput()) {
-        return 1167;
+DWORD WINAPI Hook_XInputSetState(DWORD dwUserIndex, void* pVibration) { // Intercept XInputSetState (Rumble).
+    if (ShouldBlockInput()) { // Check if input is blocked.
+        return 1167; // ERROR_DEVICE_NOT_CONNECTED - pretend device isn't connected so game stops rumbling.
     }
-    return real_XInputSetState(dwUserIndex, pVibration);
+    return real_XInputSetState(dwUserIndex, pVibration); // Otherwise, set the rumble state normally.
 }
 
-DWORD WINAPI Hook_XInputGetKeystroke(DWORD dwUserIndex, DWORD dwReserved, void* pKeystroke) {
-    if (ShouldBlockInput()) {
-        if (pKeystroke) memset(pKeystroke, 0, 8);
-        return 1167; 
+DWORD WINAPI Hook_XInputGetKeystroke(DWORD dwUserIndex, DWORD dwReserved, void* pKeystroke) { // Intercept XInputGetKeystroke.
+    if (ShouldBlockInput()) { // Check if we should block.
+        if (pKeystroke) memset(pKeystroke, 0, 8); // Clear the XINPUT_KEYSTROKE struct (8 bytes).
+        return 1167; // Return ERROR_DEVICE_NOT_CONNECTED.
     }
-    return real_XInputGetKeystroke(dwUserIndex, dwReserved, pKeystroke);
+    return real_XInputGetKeystroke(dwUserIndex, dwReserved, pKeystroke); // Otherwise, get keystroke normally.
 }
 
+// We must intercept XInputGetStateEx (ordinal 100) exactly like XInputGetState, because Unreal Engine 
+// will silently fall back to it for internal state polling if it finds it.
 DWORD WINAPI Hook_XInputGetStateEx(DWORD dwUserIndex, void* pState) {
-    DWORD res = real_XInputGetStateEx(dwUserIndex, pState);
-    if (res == ERROR_SUCCESS && pState && ShouldBlockInput()) {
-        memset(pState, 0, 16);
+    DWORD res = real_XInputGetStateEx(dwUserIndex, pState); // Call the real underlying function.
+    if (res == ERROR_SUCCESS && pState && ShouldBlockInput()) { // If call succeeded and state is valid, see if input is blocked.
+        memset(pState, 0, 16); // Zero out the state to report neutral inputs.
     }
-    return res;
+    return res; // Return original response code.
 }
 
 
@@ -369,47 +391,47 @@ DWORD WINAPI Hook_XInputGetStateEx(DWORD dwUserIndex, void* pState) {
 // MOUSE AND KEYBOARD STATE INTERCEPTORS (Desktop Configuration Bypass)
 // ============================================================================
 typedef BOOL (WINAPI *GetCursorPos_t)(LPPOINT lpPoint);
-GetCursorPos_t real_GetCursorPos = nullptr;
-BOOL WINAPI Hook_GetCursorPos(LPPOINT lpPoint) {
-    BOOL result = real_GetCursorPos(lpPoint);
-    if (result && ShouldBlockInput()) {
+GetCursorPos_t real_GetCursorPos = nullptr; // Store the original GetCursorPos pointer.
+BOOL WINAPI Hook_GetCursorPos(LPPOINT lpPoint) { // Intercept GetCursorPos.
+    BOOL result = real_GetCursorPos(lpPoint); // Get the real cursor position.
+    if (result && ShouldBlockInput()) { // Check if the function succeeded and we should block input.
         // Freeze the cursor at 0,0 for the game
-        if (lpPoint) { lpPoint->x = 0; lpPoint->y = 0; }
+        if (lpPoint) { lpPoint->x = 0; lpPoint->y = 0; } // Set coordinates to top-left to prevent camera spinning.
     }
-    return result;
+    return result; // Return the success status.
 }
 
 typedef BOOL (WINAPI *SetCursorPos_t)(int X, int Y);
-SetCursorPos_t real_SetCursorPos = nullptr;
-BOOL WINAPI Hook_SetCursorPos(int X, int Y) {
-    if (ShouldBlockInput()) {
-        return TRUE; // Ignore sets
+SetCursorPos_t real_SetCursorPos = nullptr; // Store the original SetCursorPos pointer.
+BOOL WINAPI Hook_SetCursorPos(int X, int Y) { // Intercept SetCursorPos.
+    if (ShouldBlockInput()) { // Check if input is blocked.
+        return TRUE; // Ignore attempts to set cursor position and fake success.
     }
-    return real_SetCursorPos(X, Y);
+    return real_SetCursorPos(X, Y); // Otherwise, actually set the cursor position.
 }
 
 typedef SHORT (WINAPI *GetAsyncKeyState_t)(int vKey);
-GetAsyncKeyState_t real_GetAsyncKeyState = nullptr;
-SHORT WINAPI Hook_GetAsyncKeyState(int vKey) {
-    if (ShouldBlockInput()) return 0;
-    return real_GetAsyncKeyState(vKey);
+GetAsyncKeyState_t real_GetAsyncKeyState = nullptr; // Store the original GetAsyncKeyState pointer.
+SHORT WINAPI Hook_GetAsyncKeyState(int vKey) { // Intercept GetAsyncKeyState.
+    if (ShouldBlockInput()) return 0; // Return 0 (key not pressed) if input is blocked.
+    return real_GetAsyncKeyState(vKey); // Otherwise, get the actual async key state.
 }
 
 typedef SHORT (WINAPI *GetKeyState_t)(int vKey);
-GetKeyState_t real_GetKeyState = nullptr;
-SHORT WINAPI Hook_GetKeyState(int vKey) {
-    if (ShouldBlockInput()) return 0;
-    return real_GetKeyState(vKey);
+GetKeyState_t real_GetKeyState = nullptr; // Store the original GetKeyState pointer.
+SHORT WINAPI Hook_GetKeyState(int vKey) { // Intercept GetKeyState.
+    if (ShouldBlockInput()) return 0; // Return 0 (key not pressed) if input is blocked.
+    return real_GetKeyState(vKey); // Otherwise, return actual key state.
 }
 
 typedef BOOL (WINAPI *GetKeyboardState_t)(PBYTE lpKeyState);
-GetKeyboardState_t real_GetKeyboardState = nullptr;
-BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
-    BOOL result = real_GetKeyboardState(lpKeyState);
-    if (result && ShouldBlockInput() && lpKeyState) {
-        memset(lpKeyState, 0, 256);
+GetKeyboardState_t real_GetKeyboardState = nullptr; // Store the original GetKeyboardState pointer.
+BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) { // Intercept GetKeyboardState.
+    BOOL result = real_GetKeyboardState(lpKeyState); // Retrieve the current keyboard state.
+    if (result && ShouldBlockInput() && lpKeyState) { // If successful and blocking is on and pointer is valid.
+        memset(lpKeyState, 0, 256); // Zero out the entire 256-byte keyboard state array.
     }
-    return result;
+    return result; // Return the function's status.
 }
 
 // ============================================================================
@@ -418,60 +440,63 @@ BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
 // GAMEINPUT INTERCEPTOR (Microsoft GDK)
 // ============================================================================
 typedef HRESULT (WINAPI *IGameInput_GetCurrentReading_t)(void* pThis, UINT32 inputKind, void* device, void** reading);
-IGameInput_GetCurrentReading_t real_IGameInput_GetCurrentReading = nullptr;
+IGameInput_GetCurrentReading_t real_IGameInput_GetCurrentReading = nullptr; // Store the original pointer.
 
 typedef HRESULT (WINAPI *IGameInput_GetNextReading_t)(void* pThis, void* refReading, UINT32 inputKind, void* device, void** reading);
-IGameInput_GetNextReading_t real_IGameInput_GetNextReading = nullptr;
-IGameInput_GetNextReading_t real_IGameInput_GetPreviousReading = nullptr;
+IGameInput_GetNextReading_t real_IGameInput_GetNextReading = nullptr; // Store the original pointer for NextReading.
+IGameInput_GetNextReading_t real_IGameInput_GetPreviousReading = nullptr; // Store the original pointer for PreviousReading (same signature).
 
-HRESULT WINAPI Hook_IGameInput_GetCurrentReading(void* pThis, UINT32 inputKind, void* device, void** reading) {
-    if (ShouldBlockInput()) {
-        static std::once_flag log_flag;
-        std::call_once(log_flag, []() {
-            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "BLOCKED: GameInput GetCurrentReading intercepted successfully!\n"); fclose(f); }
+HRESULT WINAPI Hook_IGameInput_GetCurrentReading(void* pThis, UINT32 inputKind, void* device, void** reading) { // Intercept GetCurrentReading.
+    if (ShouldBlockInput()) { // Check if we should block.
+        static std::once_flag log_flag; // Flag to log this intercept only once.
+        std::call_once(log_flag, []() { // Ensure lambda is executed at most once.
+            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "BLOCKED: GameInput GetCurrentReading intercepted successfully!\n"); fclose(f); } // Open log, write, close.
         });
-        if (reading) *reading = nullptr;
-        return 0x8007048F; // ERROR_DEVICE_NOT_CONNECTED
+        if (reading) *reading = nullptr; // Set the output reading pointer to null.
+        return 0x8007048F; // Return ERROR_DEVICE_NOT_CONNECTED to simulate device drop.
     }
-    return real_IGameInput_GetCurrentReading(pThis, inputKind, device, reading);
+    return real_IGameInput_GetCurrentReading(pThis, inputKind, device, reading); // If not blocking, call original GetCurrentReading.
 }
 
-HRESULT WINAPI Hook_IGameInput_GetNextReading(void* pThis, void* refReading, UINT32 inputKind, void* device, void** reading) {
-    if (ShouldBlockInput()) {
-        static std::once_flag log_flag;
-        std::call_once(log_flag, []() {
-            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "BLOCKED: GameInput GetNextReading intercepted successfully!\n"); fclose(f); }
+HRESULT WINAPI Hook_IGameInput_GetNextReading(void* pThis, void* refReading, UINT32 inputKind, void* device, void** reading) { // Intercept GetNextReading.
+    if (ShouldBlockInput()) { // Check if we should block.
+        static std::once_flag log_flag; // Flag to log this intercept only once.
+        std::call_once(log_flag, []() { // Ensure lambda is executed at most once.
+            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "BLOCKED: GameInput GetNextReading intercepted successfully!\n"); fclose(f); } // Open log, write, close.
         });
-        if (reading) *reading = nullptr;
-        return 0x8007048F;
+        if (reading) *reading = nullptr; // Set the output reading pointer to null.
+        return 0x8007048F; // Return ERROR_DEVICE_NOT_CONNECTED.
     }
-    return real_IGameInput_GetNextReading(pThis, refReading, inputKind, device, reading);
+    return real_IGameInput_GetNextReading(pThis, refReading, inputKind, device, reading); // Otherwise, fetch next reading normally.
 }
 
-HRESULT WINAPI Hook_IGameInput_GetPreviousReading(void* pThis, void* refReading, UINT32 inputKind, void* device, void** reading) {
-    if (ShouldBlockInput()) {
-        static std::once_flag log_flag;
-        std::call_once(log_flag, []() {
-            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "BLOCKED: GameInput GetPreviousReading intercepted successfully!\n"); fclose(f); }
+HRESULT WINAPI Hook_IGameInput_GetPreviousReading(void* pThis, void* refReading, UINT32 inputKind, void* device, void** reading) { // Intercept GetPreviousReading.
+    if (ShouldBlockInput()) { // Check if we should block.
+        static std::once_flag log_flag; // Flag to log this intercept only once.
+        std::call_once(log_flag, []() { // Ensure lambda is executed at most once.
+            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "BLOCKED: GameInput GetPreviousReading intercepted successfully!\n"); fclose(f); } // Open log, write, close.
         });
-        if (reading) *reading = nullptr;
-        return 0x8007048F;
+        if (reading) *reading = nullptr; // Set the output reading pointer to null.
+        return 0x8007048F; // Return ERROR_DEVICE_NOT_CONNECTED.
     }
-    return real_IGameInput_GetPreviousReading(pThis, refReading, inputKind, device, reading);
+    return real_IGameInput_GetPreviousReading(pThis, refReading, inputKind, device, reading); // Otherwise, fetch previous reading normally.
 }
 
 typedef HRESULT (WINAPI *GameInputCreate_t)(void** gameInput);
-GameInputCreate_t real_GameInputCreate = nullptr;
-HRESULT WINAPI Hook_GameInputCreate(void** gameInput) {
-    FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "API DETECT: GameInputCreate Called!\n"); fclose(f); }
-    HRESULT hr = real_GameInputCreate(gameInput);
-    if (SUCCEEDED(hr) && gameInput && *gameInput) {
-        void** vtable = *(void***)(*gameInput);
+GameInputCreate_t real_GameInputCreate = nullptr; // Store original GameInputCreate function pointer.
+HRESULT WINAPI Hook_GameInputCreate(void** gameInput) { // Intercept GameInputCreate to hook COM interfaces dynamically.
+    FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "API DETECT: GameInputCreate Called!\n"); fclose(f); } // Log the creation call.
+    HRESULT hr = real_GameInputCreate(gameInput); // Call the original GameInputCreate to get the interface.
+    if (SUCCEEDED(hr) && gameInput && *gameInput) { // Check if interface creation succeeded.
+        void** vtable = *(void***)(*gameInput); // Dereference the object to get the VTable array.
+        // Hook GetCurrentReading (index 4 in IGameInput vtable)
         if (MH_CreateHook(vtable[4], (LPVOID)&Hook_IGameInput_GetCurrentReading, (reinterpret_cast<LPVOID*>(&real_IGameInput_GetCurrentReading))) == MH_OK) MH_EnableHook(vtable[4]);
+        // Hook GetNextReading (index 5)
         if (MH_CreateHook(vtable[5], (LPVOID)&Hook_IGameInput_GetNextReading, (reinterpret_cast<LPVOID*>(&real_IGameInput_GetNextReading))) == MH_OK) MH_EnableHook(vtable[5]);
+        // Hook GetPreviousReading (index 6)
         if (MH_CreateHook(vtable[6], (LPVOID)&Hook_IGameInput_GetPreviousReading, (reinterpret_cast<LPVOID*>(&real_IGameInput_GetPreviousReading))) == MH_OK) MH_EnableHook(vtable[6]);
     }
-    return hr;
+    return hr; // Return original result.
 }
 
 // ============================================================================
@@ -480,35 +505,37 @@ HRESULT WINAPI Hook_GameInputCreate(void** gameInput) {
 typedef HRESULT (WINAPI* GetCurrentReading_t)(void* pThis, UINT32 bLen, BOOLEAN* bArr, UINT32 sLen, void* sArr, UINT32 aLen, double* aArr, UINT64* ts);
 GetCurrentReading_t real_GetCurrentReading = nullptr;
 HRESULT WINAPI Hook_GetCurrentReading(void* pThis, UINT32 bLen, BOOLEAN* bArr, UINT32 sLen, void* sArr, UINT32 aLen, double* aArr, UINT64* ts) {
-    HRESULT hr = real_GetCurrentReading(pThis, bLen, bArr, sLen, sArr, aLen, aArr, ts);
-    if (SUCCEEDED(hr) && ShouldBlockInput()) {
-        if (bArr && bLen > 0) memset(bArr, 0, bLen * sizeof(BOOLEAN));
-        if (sArr && sLen > 0) memset(sArr, 0, sLen * sizeof(void*));
-        if (aArr && aLen > 0) for (UINT32 i = 0; i < aLen; ++i) aArr[i] = 0.5;
+    HRESULT hr = real_GetCurrentReading(pThis, bLen, bArr, sLen, sArr, aLen, aArr, ts); // Retrieve the reading.
+    if (SUCCEEDED(hr) && ShouldBlockInput()) { // Check if reading succeeded and we need to block input.
+        if (bArr && bLen > 0) memset(bArr, 0, bLen * sizeof(BOOLEAN)); // Zero out the buttons array.
+        if (sArr && sLen > 0) memset(sArr, 0, sLen * sizeof(void*)); // Zero out the switches/D-Pad array.
+        if (aArr && aLen > 0) for (UINT32 i = 0; i < aLen; ++i) aArr[i] = 0.5; // Set all analog axes to center (0.5 for WGI).
     }
-    return hr;
+    return hr; // Return the original result.
 }
 
 typedef HRESULT (WINAPI* EventHandler_Invoke_t)(void* pThis, void* sender, void* args);
 EventHandler_Invoke_t real_EventHandler_Invoke = nullptr;
-HRESULT WINAPI Hook_EventHandler_Invoke(void* pThis, void* sender, void* args) {
-    if (args) {
-        void** vtable = *(void***)args;
-        void* get_reading = vtable[12];
+HRESULT WINAPI Hook_EventHandler_Invoke(void* pThis, void* sender, void* args) { // Hook the event handler invocation.
+    if (args) { // Check if event arguments exist.
+        void** vtable = *(void***)args; // Get the VTable from the args (which is typically the controller object).
+        void* get_reading = vtable[12]; // Index 12 is typically GetCurrentReading for RawGameController.
+        // Hook the GetCurrentReading method on the specific controller instance.
         if (MH_CreateHook(get_reading, (LPVOID)&Hook_GetCurrentReading, (reinterpret_cast<LPVOID*>(&real_GetCurrentReading))) == MH_OK) MH_EnableHook(get_reading);
     }
-    return real_EventHandler_Invoke(pThis, sender, args);
+    return real_EventHandler_Invoke(pThis, sender, args); // Execute original invoke.
 }
 
 typedef HRESULT (WINAPI* add_RawGameControllerAdded_t)(void* pThis, void* eventHandler, void* token);
 add_RawGameControllerAdded_t real_add_RawGameControllerAdded = nullptr;
-HRESULT WINAPI Hook_add_RawGameControllerAdded(void* pThis, void* eventHandler, void* token) {
-    if (eventHandler) {
-        void** vtable = *(void***)eventHandler;
-        void* invoke = vtable[3];
+HRESULT WINAPI Hook_add_RawGameControllerAdded(void* pThis, void* eventHandler, void* token) { // Hook when a new controller event listener is added.
+    if (eventHandler) { // Check if event handler is valid.
+        void** vtable = *(void***)eventHandler; // Get event handler VTable.
+        void* invoke = vtable[3]; // Index 3 is typically the Invoke method.
+        // Hook the Invoke method of this event handler so we can intercept controller instances when they are connected.
         if (MH_CreateHook(invoke, (LPVOID)&Hook_EventHandler_Invoke, (reinterpret_cast<LPVOID*>(&real_EventHandler_Invoke))) == MH_OK) MH_EnableHook(invoke);
     }
-    return real_add_RawGameControllerAdded(pThis, eventHandler, token);
+    return real_add_RawGameControllerAdded(pThis, eventHandler, token); // Forward to original function.
 }
 
 typedef HRESULT (WINAPI *RoGetActivationFactory_t)(void* activatableClassId, REFIID iid, void** factory);
@@ -516,112 +543,113 @@ RoGetActivationFactory_t real_RoGetActivationFactory = nullptr;
 typedef PCWSTR (WINAPI *WindowsGetStringRawBuffer_t)(void* string, UINT32* length);
 WindowsGetStringRawBuffer_t ptr_WindowsGetStringRawBuffer = nullptr;
 
-HRESULT WINAPI Hook_RoGetActivationFactory(void* activatableClassId, REFIID iid, void** factory) {
-    if (activatableClassId && ptr_WindowsGetStringRawBuffer) {
-        PCWSTR className = ptr_WindowsGetStringRawBuffer(activatableClassId, nullptr);
-        if (className) {
-            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fwprintf(f, L"RoGetActivationFactory Called: %s\n", className); fclose(f); }
+HRESULT WINAPI Hook_RoGetActivationFactory(void* activatableClassId, REFIID iid, void** factory) { // Hook the WinRT object factory to intercept WGI instantiation.
+    if (activatableClassId && ptr_WindowsGetStringRawBuffer) { // Check if the class ID and string extractor are available.
+        PCWSTR className = ptr_WindowsGetStringRawBuffer(activatableClassId, nullptr); // Get the string name of the class being activated.
+        if (className) { // Check if name is valid.
+            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fwprintf(f, L"RoGetActivationFactory Called: %s\n", className); fclose(f); } // Log the requested WinRT class.
         }
     }
     
-    HRESULT hr = real_RoGetActivationFactory(activatableClassId, iid, factory);
-    if (SUCCEEDED(hr) && factory && *factory && activatableClassId && ptr_WindowsGetStringRawBuffer) {
-        PCWSTR className = ptr_WindowsGetStringRawBuffer(activatableClassId, nullptr);
-        if (className && wcsstr(className, L"Windows.Gaming.Input.RawGameController") != nullptr) {
-            void** vtable = *(void***)(*factory);
-            void* add_event = vtable[6];
+    HRESULT hr = real_RoGetActivationFactory(activatableClassId, iid, factory); // Call real factory getter.
+    if (SUCCEEDED(hr) && factory && *factory && activatableClassId && ptr_WindowsGetStringRawBuffer) { // If successful, check if it's the class we care about.
+        PCWSTR className = ptr_WindowsGetStringRawBuffer(activatableClassId, nullptr); // Get the class name again.
+        if (className && wcsstr(className, L"Windows.Gaming.Input.RawGameController") != nullptr) { // If it is RawGameController factory.
+            void** vtable = *(void***)(*factory); // Get the factory VTable.
+            void* add_event = vtable[6]; // Index 6 is typically add_RawGameControllerAdded.
+            // Hook the add event method.
             if (MH_CreateHook(add_event, (LPVOID)&Hook_add_RawGameControllerAdded, (reinterpret_cast<LPVOID*>(&real_add_RawGameControllerAdded))) == MH_OK) MH_EnableHook(add_event);
         }
     }
-    return hr;
+    return hr; // Return factory creation result.
 }
 
 
 // ============================================================================
 // BACKGROUND WORKER THREAD
 // ============================================================================
-DWORD WINAPI BackgroundWorker(LPVOID lpParam) {
-    bool xinputHooked = false;
-    bool gameinputHooked = false;
-    DWORD currentProcessId = GetCurrentProcessId();
+DWORD WINAPI BackgroundWorker(LPVOID lpParam) { // The main background thread entry point.
+    bool xinputHooked = false; // Flag to track if XInput has been hooked.
+    bool gameinputHooked = false; // Flag to track if GameInput has been hooked.
+    DWORD currentProcessId = GetCurrentProcessId(); // Cache the current process ID.
     
-    while (true) {
+    while (true) { // Enter infinite polling loop.
         // Track Focus State efficiently
-        HWND hForeground = GetForegroundWindow();
-        if (hForeground) {
-            DWORD foregroundProcessId = 0;
-            GetWindowThreadProcessId(hForeground, &foregroundProcessId);
-            g_bIsGameInFocus.store((foregroundProcessId == currentProcessId), std::memory_order_relaxed);
-        } else {
-            g_bIsGameInFocus.store(false, std::memory_order_relaxed);
+        HWND hForeground = GetForegroundWindow(); // Get the currently focused window handle.
+        if (hForeground) { // Check if a foreground window exists.
+            DWORD foregroundProcessId = 0; // Initialize variable for process ID.
+            GetWindowThreadProcessId(hForeground, &foregroundProcessId); // Get the process ID of the focused window.
+            g_bIsGameInFocus.store((foregroundProcessId == currentProcessId), std::memory_order_relaxed); // Update focus state: true if game process owns focused window.
+        } else { // If no foreground window exists.
+            g_bIsGameInFocus.store(false, std::memory_order_relaxed); // Assume game is not in focus.
         }
 
-        if (!g_pSteamListener) {
-            if (GetModuleHandleA("steam_api64.dll") != NULL) {
-                std::call_once(g_SteamInitOnceFlag, []() {
-                    g_pSteamListener = new CSteamOverlayListener();
+        if (!g_pSteamListener) { // If the Steam listener isn't initialized yet.
+            if (GetModuleHandleA("steam_api64.dll") != NULL) { // Check if steam_api64.dll has been loaded into the process.
+                std::call_once(g_SteamInitOnceFlag, []() { // Ensure listener is created only once.
+                    g_pSteamListener = new CSteamOverlayListener(); // Instantiate the listener to register the overlay callback.
                 });
             }
         }
         
-        if (ShouldBlockInput()) {
-            if (GetModuleHandleA("GameOverlayRenderer64.dll") == NULL) {
-                g_bIsSteamOverlayActive.store(false, std::memory_order_release);
-                FILE* f;
-                if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) {
-                    fprintf(f, "WATCHDOG: Steam crashed! Force-disabled firewall.\n");
-                    fclose(f);
+        if (ShouldBlockInput()) { // If inputs are currently being blocked.
+            if (GetModuleHandleA("GameOverlayRenderer64.dll") == NULL) { // Check if the overlay renderer DLL is missing (meaning Steam crashed or was forcibly closed).
+                g_bIsSteamOverlayActive.store(false, std::memory_order_release); // Force-disable the block so the user doesn't get permanently stuck.
+                FILE* f; // Declare file pointer.
+                if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { // Open log file.
+                    fprintf(f, "WATCHDOG: Steam crashed! Force-disabled firewall.\n"); // Log the watchdog intervention.
+                    fclose(f); // Close log file.
                 }
             }
         }
         
-        if (!xinputHooked) {
-            char sysDir[MAX_PATH];
-            if (GetSystemDirectoryA(sysDir, MAX_PATH)) {
-                strcat_s(sysDir, sizeof(sysDir), "\\xinput1_4.dll");
-                HMODULE hXInput = LoadLibraryExA(sysDir, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-                if (!hXInput) {
-                    GetSystemDirectoryA(sysDir, MAX_PATH);
-                    strcat_s(sysDir, sizeof(sysDir), "\\xinput1_3.dll");
-                    hXInput = LoadLibraryExA(sysDir, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!xinputHooked) { // If XInput hasn't been hooked yet.
+            char sysDir[MAX_PATH]; // Buffer for system directory path.
+            if (GetSystemDirectoryA(sysDir, MAX_PATH)) { // Get the Windows System32 directory.
+                strcat_s(sysDir, sizeof(sysDir), "\\xinput1_4.dll"); // Append the XInput DLL name.
+                HMODULE hXInput = LoadLibraryExA(sysDir, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32); // Try to load it explicitly from System32.
+                if (!hXInput) { // If loading failed.
+                    GetSystemDirectoryA(sysDir, MAX_PATH); // Refresh system directory path.
+                    strcat_s(sysDir, sizeof(sysDir), "\\xinput1_3.dll"); // Try fallback XInput 1.3 DLL.
+                    hXInput = LoadLibraryExA(sysDir, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32); // Attempt to load fallback.
                 }
                 
-                if (hXInput) {
-                    void* xget = GetProcAddress(hXInput, "XInputGetState");
-                    void* xset = GetProcAddress(hXInput, "XInputSetState");
-                    void* xkey = GetProcAddress(hXInput, "XInputGetKeystroke");
-                    void* xgetex = GetProcAddress(hXInput, (LPCSTR)100);
+                if (hXInput) { // If either version of XInput was successfully loaded.
+                    void* xget = GetProcAddress(hXInput, "XInputGetState"); // Get original XInputGetState pointer.
+                    void* xset = GetProcAddress(hXInput, "XInputSetState"); // Get original XInputSetState pointer.
+                    void* xkey = GetProcAddress(hXInput, "XInputGetKeystroke"); // Get original XInputGetKeystroke pointer.
+                    void* xgetex = GetProcAddress(hXInput, (LPCSTR)100); // Get original XInputGetStateEx pointer (ordinal 100).
                     
-                    if (xget) { if (MH_CreateHook(xget, (LPVOID)&Hook_XInputGetState, (reinterpret_cast<LPVOID*>(&real_XInputGetState))) == MH_OK) MH_EnableHook(xget); }
-                    if (xset) { if (MH_CreateHook(xset, (LPVOID)&Hook_XInputSetState, (reinterpret_cast<LPVOID*>(&real_XInputSetState))) == MH_OK) MH_EnableHook(xset); }
-                    if (xkey) { if (MH_CreateHook(xkey, (LPVOID)&Hook_XInputGetKeystroke, (reinterpret_cast<LPVOID*>(&real_XInputGetKeystroke))) == MH_OK) MH_EnableHook(xkey); }
-                    if (xgetex) { if (MH_CreateHook(xgetex, (LPVOID)&Hook_XInputGetStateEx, (reinterpret_cast<LPVOID*>(&real_XInputGetStateEx))) == MH_OK) MH_EnableHook(xgetex); }
+                    if (xget) { if (MH_CreateHook(xget, (LPVOID)&Hook_XInputGetState, (reinterpret_cast<LPVOID*>(&real_XInputGetState))) == MH_OK) MH_EnableHook(xget); } // Hook XInputGetState if available.
+                    if (xset) { if (MH_CreateHook(xset, (LPVOID)&Hook_XInputSetState, (reinterpret_cast<LPVOID*>(&real_XInputSetState))) == MH_OK) MH_EnableHook(xset); } // Hook XInputSetState if available.
+                    if (xkey) { if (MH_CreateHook(xkey, (LPVOID)&Hook_XInputGetKeystroke, (reinterpret_cast<LPVOID*>(&real_XInputGetKeystroke))) == MH_OK) MH_EnableHook(xkey); } // Hook XInputGetKeystroke if available.
+                    if (xgetex) { if (MH_CreateHook(xgetex, (LPVOID)&Hook_XInputGetStateEx, (reinterpret_cast<LPVOID*>(&real_XInputGetStateEx))) == MH_OK) MH_EnableHook(xgetex); } // Hook XInputGetStateEx if available.
                     
-                    xinputHooked = true;
-                    FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "XInput dynamically hooked by BackgroundWorker!\n"); fclose(f); }
+                    xinputHooked = true; // Mark XInput as hooked so we don't try again.
+                    FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "XInput dynamically hooked by BackgroundWorker!\n"); fclose(f); } // Log the successful hook.
                 }
             }
         }
         
-        if (!gameinputHooked) {
-            char sysDir[MAX_PATH];
-            if (GetSystemDirectoryA(sysDir, MAX_PATH)) {
-                strcat_s(sysDir, sizeof(sysDir), "\\gameinput.dll");
-                HMODULE hGameInput = LoadLibraryExA(sysDir, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-                if (hGameInput) {
-                    void* gic = GetProcAddress(hGameInput, "GameInputCreate");
-                    if (gic) {
-                        if (MH_CreateHook(gic, (LPVOID)&Hook_GameInputCreate, (reinterpret_cast<LPVOID*>(&real_GameInputCreate))) == MH_OK) MH_EnableHook(gic);
-                        gameinputHooked = true;
-                        FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "GameInput dynamically hooked by BackgroundWorker!\n"); fclose(f); }
+        if (!gameinputHooked) { // If GameInput hasn't been hooked yet.
+            char sysDir[MAX_PATH]; // Buffer for system directory.
+            if (GetSystemDirectoryA(sysDir, MAX_PATH)) { // Get Windows system directory.
+                strcat_s(sysDir, sizeof(sysDir), "\\gameinput.dll"); // Append GameInput DLL name.
+                HMODULE hGameInput = LoadLibraryExA(sysDir, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32); // Attempt to load gameinput.dll.
+                if (hGameInput) { // If GameInput was successfully loaded.
+                    void* gic = GetProcAddress(hGameInput, "GameInputCreate"); // Get address of GameInputCreate.
+                    if (gic) { // If function exists in the loaded module.
+                        if (MH_CreateHook(gic, (LPVOID)&Hook_GameInputCreate, (reinterpret_cast<LPVOID*>(&real_GameInputCreate))) == MH_OK) MH_EnableHook(gic); // Hook GameInputCreate.
+                        gameinputHooked = true; // Mark as hooked.
+                        FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "GameInput dynamically hooked by BackgroundWorker!\n"); fclose(f); } // Log hook success.
                     }
                 }
             }
         }
         
-        Sleep(50);
+        Sleep(50); // Pause the thread for 50 milliseconds to prevent 100% CPU usage.
     }
-    return 0;
+    return 0; // Return 0 (never reached).
 }
 
 // ============================================================================
@@ -630,139 +658,153 @@ DWORD WINAPI BackgroundWorker(LPVOID lpParam) {
 #include <unordered_set>
 #include <shared_mutex>
 
-std::unordered_set<HANDLE> g_HidHandles;
-std::shared_mutex g_HidMutex;
+std::unordered_set<HANDLE> g_HidHandles; // Set to store OS handles identified as HID devices.
+std::shared_mutex g_HidMutex; // Mutex to synchronize access to the HID handle set.
 
+// Require hardware path to match specific DualSense/DualShock PIDs to avoid corrupting Sony TV/Headset media streams.
+// Parses the hardware path of a newly opened file handle. If the path matches specific Sony DualSense/DualShock 
+// Product IDs, the handle is saved into a global lock-free tracking set for the ReadFile interceptor.
 void RegisterHidHandle(HANDLE h, LPCWSTR name) {
-    if (h != INVALID_HANDLE_VALUE && name) {
-        std::wstring s(name);
-        for (auto& c : s) c = towlower(c);
-        if (s.find(L"vid_054c") != std::wstring::npos) {
-            std::unique_lock<std::shared_mutex> lock(g_HidMutex);
-            g_HidHandles.insert(h);
-            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fwprintf(f, L"Registered HID Handle (W): %s\n", name); fclose(f); }
+    if (h != INVALID_HANDLE_VALUE && name) { // Ensure handle is valid and name pointer is valid.
+        std::wstring s(name); // Copy name to wide string.
+        for (auto& c : s) c = towlower(c); // Convert entire string to lowercase for case-insensitive matching.
+        if (s.find(L"vid_054c") != std::wstring::npos && // Check if name contains Sony Vendor ID.
+            (s.find(L"pid_0ce6") != std::wstring::npos || s.find(L"pid_0df2") != std::wstring::npos || // Check for DualSense/DualSense Edge PIDs.
+             s.find(L"pid_05c4") != std::wstring::npos || s.find(L"pid_09cc") != std::wstring::npos)) { // Check for DualShock 4 PIDs.
+            std::unique_lock<std::shared_mutex> lock(g_HidMutex); // Acquire exclusive lock to update the shared set.
+            g_HidHandles.insert(h); // Add handle to our tracked HID set.
         }
     }
 }
 
+// ANSI equivalent of the HID hardware path parser. Required because older game engine modules 
+// may still use the legacy CreateFileA API instead of the wide-string version.
 void RegisterHidHandleA(HANDLE h, LPCSTR name) {
-    if (h != INVALID_HANDLE_VALUE && name) {
-        std::string s(name);
-        for (auto& c : s) c = tolower(c);
-        if (s.find("vid_054c") != std::string::npos) {
-            std::unique_lock<std::shared_mutex> lock(g_HidMutex);
-            g_HidHandles.insert(h);
-            FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "Registered HID Handle (A): %s\n", name); fclose(f); }
+    if (h != INVALID_HANDLE_VALUE && name) { // Ensure handle is valid and name pointer is valid.
+        std::string s(name); // Copy name to string.
+        for (auto& c : s) c = tolower(c); // Convert to lowercase.
+        if (s.find("vid_054c") != std::string::npos && // Check for Sony Vendor ID.
+            (s.find("pid_0ce6") != std::string::npos || s.find("pid_0df2") != std::string::npos || // Check for DualSense PIDs.
+             s.find("pid_05c4") != std::string::npos || s.find("pid_09cc") != std::string::npos)) { // Check for DualShock PIDs.
+            std::unique_lock<std::shared_mutex> lock(g_HidMutex); // Acquire exclusive lock.
+            g_HidHandles.insert(h); // Add handle to tracked set.
         }
     }
 }
 
+// Fast, thread-safe lookup used by ReadFile and DeviceIoControl to verify if the file stream 
+// currently being accessed belongs to a DualSense controller rather than a media file.
 bool IsHidHandle(HANDLE h) {
-    std::shared_lock<std::shared_mutex> lock(g_HidMutex);
-    return g_HidHandles.find(h) != g_HidHandles.end();
+    std::shared_lock<std::shared_mutex> lock(g_HidMutex); // Acquire shared read lock.
+    return g_HidHandles.find(h) != g_HidHandles.end(); // Return true if the handle exists in our set.
 }
 
 typedef HANDLE (WINAPI *CreateFileW_t)(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
 CreateFileW_t real_CreateFileW = nullptr;
+// We must hook CreateFile so we can spy on the Windows kernel when Unreal Engine opens a USB device.
+// If the filename matches a DualSense PID, we cache the handle so our ReadFile hook knows which handles to intercept.
 HANDLE WINAPI Hook_CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
-    bool isHid = false;
-    if (lpFileName) {
-        std::wstring s(lpFileName);
-        for (auto& c : s) c = towlower(c);
-        if (s.find(L"vid_054c") != std::wstring::npos) isHid = true;
-    }
-    
-    HANDLE h = real_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
-    RegisterHidHandle(h, lpFileName);
-    return h;
+    HANDLE h = real_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile); 
+    RegisterHidHandle(h, lpFileName); 
+    return h; 
 }
 
 typedef HANDLE (WINAPI *CreateFile2_t)(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, DWORD dwCreationDisposition, void* pCreateExParams);
 CreateFile2_t real_CreateFile2 = nullptr;
+// We must hook CreateFile2 for the exact same reason as CreateFileW (caching DualSense hardware handles).
 HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, DWORD dwCreationDisposition, void* pCreateExParams) {
-    bool isHid = false;
-    if (lpFileName) {
-        std::wstring s(lpFileName);
-        for (auto& c : s) c = towlower(c);
-        if (s.find(L"vid_054c") != std::wstring::npos) isHid = true;
-    }
-    
-    HANDLE h = real_CreateFile2(lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, pCreateExParams);
-    RegisterHidHandle(h, lpFileName);
-    return h;
+    HANDLE h = real_CreateFile2(lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, pCreateExParams); 
+    RegisterHidHandle(h, lpFileName); 
+    return h; 
 }
 
 typedef HANDLE (WINAPI *CreateFileA_t)(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
 CreateFileA_t real_CreateFileA = nullptr;
+// We must hook CreateFileA for the exact same reason as CreateFileW (caching DualSense hardware handles).
 HANDLE WINAPI Hook_CreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
-    bool isHid = false;
-    if (lpFileName) {
-        std::string s(lpFileName);
-        for (auto& c : s) c = tolower(c);
-        if (s.find("vid_054c") != std::string::npos) isHid = true;
+    HANDLE h = real_CreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile); 
+    RegisterHidHandleA(h, lpFileName); 
+    return h; 
+}
+
+typedef BOOL (WINAPI *CloseHandle_t)(HANDLE hObject);
+CloseHandle_t real_CloseHandle = nullptr;
+// Instantly purge dropped handles from internal watch-lists so OS doesn't recycle 
+// the handle ID for media streams (video/audio).
+BOOL WINAPI Hook_CloseHandle(HANDLE hObject) {
+    if (hObject && hObject != INVALID_HANDLE_VALUE) { // Check if handle is valid before doing work.
+        bool isHid = false; // Flag to indicate if we found the handle in our set.
+        { // Begin shared lock scope.
+            std::shared_lock<std::shared_mutex> lock(g_HidMutex); // Acquire read lock.
+            if (g_HidHandles.find(hObject) != g_HidHandles.end()) { // Check if handle is in the set.
+                isHid = true; // Mark as found.
+            }
+        }
+        if (isHid) { // If it was a tracked HID handle.
+            std::unique_lock<std::shared_mutex> lock(g_HidMutex); // Acquire exclusive write lock.
+            g_HidHandles.erase(hObject); // Remove it from the set.
+        }
     }
-    
-    HANDLE h = real_CreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
-    RegisterHidHandleA(h, lpFileName);
-    return h;
+    return real_CloseHandle(hObject); // Call original API to actually close the handle.
 }
 
 
 typedef BOOL (WINAPI *DeviceIoControl_t)(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped);
 DeviceIoControl_t real_DeviceIoControl = nullptr;
+// Returning TRUE without error prevents USB drop and avoids UE5's IOCP completely bypassing GetOverlappedResult.
 BOOL WINAPI Hook_DeviceIoControl(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped) {
-    if (ShouldBlockInput() && IsHidHandle(hDevice)) {
-        if (lpOutBuffer && nOutBufferSize >= 64) {
-            SynthesizeNeutralDualSensePacket((PBYTE)lpOutBuffer, nOutBufferSize);
+    if (ShouldBlockInput() && IsHidHandle(hDevice)) { // If we should block input AND this request targets a known Sony HID handle.
+        if (lpOutBuffer && nOutBufferSize >= 64) { // Verify the output buffer is large enough for a DualSense report.
+            SynthesizeNeutralDualSensePacket((PBYTE)lpOutBuffer, nOutBufferSize); // Write a completely neutral (centered/unpressed) report.
         }
-        if (lpBytesReturned) *lpBytesReturned = nOutBufferSize >= 64 ? 64 : nOutBufferSize;
-        if (lpOverlapped) {
-            lpOverlapped->Internal = 0;
-            lpOverlapped->InternalHigh = nOutBufferSize >= 64 ? 64 : nOutBufferSize;
-            if (lpOverlapped->hEvent) SetEvent(lpOverlapped->hEvent);
+        if (lpBytesReturned) *lpBytesReturned = nOutBufferSize >= 64 ? 64 : nOutBufferSize; // Fake the number of bytes returned.
+        if (lpOverlapped) { // If an asynchronous OVERLAPPED structure was provided.
+            lpOverlapped->Internal = 0; // Set internal status to success (0).
+            lpOverlapped->InternalHigh = nOutBufferSize >= 64 ? 64 : nOutBufferSize; // Set bytes transferred.
+            if (lpOverlapped->hEvent) SetEvent(lpOverlapped->hEvent); // Manually signal the completion event so the game's IOCP wait wakes up.
         }
-        return TRUE;
+        return TRUE; // Return success (prevent error reporting to game).
     }
-    return real_DeviceIoControl(hDevice, dwIoControlCode, lpInBuffer, nInBufferSize, lpOutBuffer, nOutBufferSize, lpBytesReturned, lpOverlapped);
+    return real_DeviceIoControl(hDevice, dwIoControlCode, lpInBuffer, nInBufferSize, lpOutBuffer, nOutBufferSize, lpBytesReturned, lpOverlapped); // Call original DeviceIoControl.
 }
 
 typedef BOOL (WINAPI *ReadFile_t)(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped);
 ReadFile_t real_ReadFile = nullptr;
 BOOL WINAPI Hook_ReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped) {
-    if (ShouldBlockInput() && IsHidHandle(hFile)) {
-        if (lpBuffer && nNumberOfBytesToRead >= 64) {
-            SynthesizeNeutralDualSensePacket((PBYTE)lpBuffer, nNumberOfBytesToRead);
+    if (ShouldBlockInput() && IsHidHandle(hFile)) { // Check if we are blocking input and the handle is a tracked Sony controller.
+        if (lpBuffer && nNumberOfBytesToRead >= 64) { // Check if buffer is large enough.
+            SynthesizeNeutralDualSensePacket((PBYTE)lpBuffer, nNumberOfBytesToRead); // Write neutral inputs to the buffer directly.
         }
-        DWORD bytesRead = nNumberOfBytesToRead >= 64 ? 64 : nNumberOfBytesToRead;
-        if (lpNumberOfBytesRead) *lpNumberOfBytesRead = bytesRead;
-        if (lpOverlapped) {
-            lpOverlapped->Internal = 0;
-            lpOverlapped->InternalHigh = bytesRead;
-            if (lpOverlapped->hEvent) SetEvent(lpOverlapped->hEvent);
+        DWORD bytesRead = nNumberOfBytesToRead >= 64 ? 64 : nNumberOfBytesToRead; // Determine bytes read to report.
+        if (lpNumberOfBytesRead) *lpNumberOfBytesRead = bytesRead; // Set the synchronous out-parameter.
+        if (lpOverlapped) { // Check for async IO structure.
+            lpOverlapped->Internal = 0; // Mark operation as successful.
+            lpOverlapped->InternalHigh = bytesRead; // Mark bytes transferred.
+            if (lpOverlapped->hEvent) SetEvent(lpOverlapped->hEvent); // Signal completion event.
         }
-        return TRUE;
+        return TRUE; // Return true to indicate immediate success.
     }
-    return real_ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped);
+    return real_ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped); // Otherwise, fall back to the real ReadFile.
 }
 
 typedef BOOL (WINAPI *GetOverlappedResult_t)(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, BOOL bWait);
 GetOverlappedResult_t real_GetOverlappedResult = nullptr;
 BOOL WINAPI Hook_GetOverlappedResult(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, BOOL bWait) {
-    if (ShouldBlockInput() && IsHidHandle(hFile)) {
-        if (lpNumberOfBytesTransferred) *lpNumberOfBytesTransferred = 64;
-        return TRUE;
+    if (ShouldBlockInput() && IsHidHandle(hFile)) { // Check if we should override.
+        if (lpNumberOfBytesTransferred) *lpNumberOfBytesTransferred = 64; // Pretend we transferred a full packet.
+        return TRUE; // Say the async op completed successfully.
     }
-    return real_GetOverlappedResult(hFile, lpOverlapped, lpNumberOfBytesTransferred, bWait);
+    return real_GetOverlappedResult(hFile, lpOverlapped, lpNumberOfBytesTransferred, bWait); // Call real function.
 }
 
 typedef BOOL (WINAPI *GetOverlappedResultEx_t)(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, DWORD dwMilliseconds, BOOL bAlertable);
 GetOverlappedResultEx_t real_GetOverlappedResultEx = nullptr;
 BOOL WINAPI Hook_GetOverlappedResultEx(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, DWORD dwMilliseconds, BOOL bAlertable) {
-    if (ShouldBlockInput() && IsHidHandle(hFile)) {
-        if (lpNumberOfBytesTransferred) *lpNumberOfBytesTransferred = 64;
-        return TRUE;
+    if (ShouldBlockInput() && IsHidHandle(hFile)) { // Check if we should override.
+        if (lpNumberOfBytesTransferred) *lpNumberOfBytesTransferred = 64; // Return faked bytes transferred count.
+        return TRUE; // Return success immediately.
     }
-    return real_GetOverlappedResultEx(hFile, lpOverlapped, lpNumberOfBytesTransferred, dwMilliseconds, bAlertable);
+    return real_GetOverlappedResultEx(hFile, lpOverlapped, lpNumberOfBytesTransferred, dwMilliseconds, bAlertable); // Fall through to real func.
 }
 
 // ============================================================================
@@ -771,158 +813,169 @@ BOOL WINAPI Hook_GetOverlappedResultEx(HANDLE hFile, LPOVERLAPPED lpOverlapped, 
 // ============================================================================
 // DYNAMIC LOADER INTERCEPTORS (LoadLibrary)
 // ============================================================================
+// Background watcher that inspects newly loaded DLLs. If the engine dynamically loads GameInput.dll 
+// late into execution, this catches it and injects our COM VTable intercepts on the fly.
 void CheckAndHookDynamicLibsW(HMODULE hModule, LPCWSTR lpLibFileName) {
-    if (!hModule || !lpLibFileName) return;
+    if (!hModule || !lpLibFileName) return; // Skip if null parameters.
     
-    if (wcsstr(lpLibFileName, L"gameinput.dll") || wcsstr(lpLibFileName, L"GameInput.dll") || wcsstr(lpLibFileName, L"GAMEINPUT.DLL")) {
-        void* gic = GetProcAddress(hModule, "GameInputCreate");
-        if (gic) {
-            if (MH_CreateHook(gic, (LPVOID)&Hook_GameInputCreate, (reinterpret_cast<LPVOID*>(&real_GameInputCreate))) == MH_OK) {
-                MH_EnableHook(gic);
-                FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fwprintf(f, L"GameInput hooked via LoadLibraryW interception! (%s)\n", lpLibFileName); fclose(f); }
+    if (wcsstr(lpLibFileName, L"gameinput.dll") || wcsstr(lpLibFileName, L"GameInput.dll") || wcsstr(lpLibFileName, L"GAMEINPUT.DLL")) { // Did they just load GameInput dynamically?
+        void* gic = GetProcAddress(hModule, "GameInputCreate"); // Get the exported function pointer.
+        if (gic) { // Check if it's there.
+            if (MH_CreateHook(gic, (LPVOID)&Hook_GameInputCreate, (reinterpret_cast<LPVOID*>(&real_GameInputCreate))) == MH_OK) { // Hook it.
+                MH_EnableHook(gic); // Enable hook immediately.
+                FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fwprintf(f, L"GameInput hooked via LoadLibraryW interception! (%s)\n", lpLibFileName); fclose(f); } // Log it.
             }
         }
     }
 }
 
+// ANSI equivalent for late-bound library interception, checking for GameInput.dll.
 void CheckAndHookDynamicLibsA(HMODULE hModule, LPCSTR lpLibFileName) {
-    if (!hModule || !lpLibFileName) return;
+    if (!hModule || !lpLibFileName) return; // Validate parameters.
     
-    if (strstr(lpLibFileName, "gameinput.dll") || strstr(lpLibFileName, "GameInput.dll") || strstr(lpLibFileName, "GAMEINPUT.DLL")) {
-        void* gic = GetProcAddress(hModule, "GameInputCreate");
-        if (gic) {
-            if (MH_CreateHook(gic, (LPVOID)&Hook_GameInputCreate, (reinterpret_cast<LPVOID*>(&real_GameInputCreate))) == MH_OK) {
-                MH_EnableHook(gic);
-                FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "GameInput hooked via LoadLibraryA interception! (%s)\n", lpLibFileName); fclose(f); }
+    if (strstr(lpLibFileName, "gameinput.dll") || strstr(lpLibFileName, "GameInput.dll") || strstr(lpLibFileName, "GAMEINPUT.DLL")) { // Check for gameinput.dll load.
+        void* gic = GetProcAddress(hModule, "GameInputCreate"); // Find the function pointer.
+        if (gic) { // Ensure function was exported.
+            if (MH_CreateHook(gic, (LPVOID)&Hook_GameInputCreate, (reinterpret_cast<LPVOID*>(&real_GameInputCreate))) == MH_OK) { // Hook the creation function.
+                MH_EnableHook(gic); // Turn it on.
+                FILE* f; if (fopen_s(&f, "proxy_loaded.txt", "a") == 0) { fprintf(f, "GameInput hooked via LoadLibraryA interception! (%s)\n", lpLibFileName); fclose(f); } // Make a log entry.
             }
         }
     }
 }
 
 typedef HMODULE (WINAPI *LoadLibraryExW_t)(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags);
-LoadLibraryExW_t real_LoadLibraryExW = nullptr;
+LoadLibraryExW_t real_LoadLibraryExW = nullptr; // Real pointer.
+// Intercepts dynamic library loading to catch Unreal Engine instantiating input modules at runtime.
 HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
-    HMODULE hModule = real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
-    CheckAndHookDynamicLibsW(hModule, lpLibFileName);
-    return hModule;
+    HMODULE hModule = real_LoadLibraryExW(lpLibFileName, hFile, dwFlags); // Forward the call.
+    CheckAndHookDynamicLibsW(hModule, lpLibFileName); // Run check against the new module.
+    return hModule; // Return module to caller.
 }
 
 typedef HMODULE (WINAPI *LoadLibraryW_t)(LPCWSTR lpLibFileName);
-LoadLibraryW_t real_LoadLibraryW = nullptr;
+LoadLibraryW_t real_LoadLibraryW = nullptr; // Real pointer.
+// Intercepts standard wide-string library loading to catch late-bound input modules.
 HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR lpLibFileName) {
-    HMODULE hModule = real_LoadLibraryW(lpLibFileName);
-    CheckAndHookDynamicLibsW(hModule, lpLibFileName);
-    return hModule;
+    HMODULE hModule = real_LoadLibraryW(lpLibFileName); // Load it normally.
+    CheckAndHookDynamicLibsW(hModule, lpLibFileName); // Inspect the freshly loaded lib.
+    return hModule; // Return the handle.
 }
 
 typedef HMODULE (WINAPI *LoadLibraryExA_t)(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags);
-LoadLibraryExA_t real_LoadLibraryExA = nullptr;
+LoadLibraryExA_t real_LoadLibraryExA = nullptr; // Real pointer.
+// Intercepts ANSI dynamic library loading to catch late-bound input modules.
 HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
-    HMODULE hModule = real_LoadLibraryExA(lpLibFileName, hFile, dwFlags);
-    CheckAndHookDynamicLibsA(hModule, lpLibFileName);
-    return hModule;
+    HMODULE hModule = real_LoadLibraryExA(lpLibFileName, hFile, dwFlags); // Normal execution.
+    CheckAndHookDynamicLibsA(hModule, lpLibFileName); // Check for gameinput DLLs.
+    return hModule; // Provide handle back.
 }
 
 typedef HMODULE (WINAPI *LoadLibraryA_t)(LPCSTR lpLibFileName);
-LoadLibraryA_t real_LoadLibraryA = nullptr;
+LoadLibraryA_t real_LoadLibraryA = nullptr; // Real pointer.
+// Intercepts standard ANSI library loading to catch late-bound input modules.
 HMODULE WINAPI Hook_LoadLibraryA(LPCSTR lpLibFileName) {
-    HMODULE hModule = real_LoadLibraryA(lpLibFileName);
-    CheckAndHookDynamicLibsA(hModule, lpLibFileName);
-    return hModule;
+    HMODULE hModule = real_LoadLibraryA(lpLibFileName); // Hand off to system.
+    CheckAndHookDynamicLibsA(hModule, lpLibFileName); // See if it's our target.
+    return hModule; // Output result.
 }
 
 // ============================================================================
 // DLL ENTRY POINT
 // ============================================================================
+// Standard Win32 entry point. Because we execute inside the process's Loader Lock, we must initialize 
+// all of our MinHook detours completely synchronously here before the engine's WinMain ever begins.
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hModule);
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) { // Only execute logic when first attaching to the process.
+        DisableThreadLibraryCalls(hModule); // Optimize performance by refusing DLL_THREAD_ATTACH / DETACH calls.
         
-        FILE* f;
-        if (fopen_s(&f, "proxy_loaded.txt", "w") == 0) {
-            fprintf(f, "VERSION_PROXY LOADED SUCCESSFULLY! Synchronous hooks initialized.\n");
-            fclose(f);
+        FILE* f; // Debug file pointer.
+        if (fopen_s(&f, "proxy_loaded.txt", "w") == 0) { // Wipe/create the proxy debug log.
+            fprintf(f, "VERSION_PROXY LOADED SUCCESSFULLY! Synchronous hooks initialized.\n"); // Note startup.
+            fclose(f); // Close log.
         }
         
-        LoadRealVersion();
+        LoadRealVersion(); // IMPORTANT: Load the actual system version.dll and map all 17 pointers so naked exports don't crash.
         
-        HMODULE hSelf;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCSTR)&DllMain, &hSelf);
+        HMODULE hSelf; // Handle to this DLL.
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCSTR)&DllMain, &hSelf); // Pin this proxy DLL in memory so it cannot be unloaded.
         
-        MH_Initialize();
+        MH_Initialize(); // Fire up MinHook framework.
         
         // --- SYNCHRONOUS HOOKS (DllMain) ---
-        HMODULE hUser32 = GetModuleHandleA("user32.dll");
-        if (hUser32) {
-            void* getRawInput = GetProcAddress(hUser32, "GetRawInputData");
-            void* peekMsgW = GetProcAddress(hUser32, "PeekMessageW");
-            void* peekMsgA = GetProcAddress(hUser32, "PeekMessageA");
-            void* getMsgW = GetProcAddress(hUser32, "GetMessageW");
-            void* getMsgA = GetProcAddress(hUser32, "GetMessageA");
-            void* dispMsgW = GetProcAddress(hUser32, "DispatchMessageW");
-            void* dispMsgA = GetProcAddress(hUser32, "DispatchMessageA");
+        HMODULE hUser32 = GetModuleHandleA("user32.dll"); // Look up user32 block for core window functionality.
+        if (hUser32) { // Ensure user32 was actually resolved.
+            void* getRawInput = GetProcAddress(hUser32, "GetRawInputData"); // Find raw input reader.
+            void* peekMsgW = GetProcAddress(hUser32, "PeekMessageW"); // Find PeekMessageW.
+            void* peekMsgA = GetProcAddress(hUser32, "PeekMessageA"); // Find PeekMessageA.
+            void* getMsgW = GetProcAddress(hUser32, "GetMessageW"); // Find GetMessageW.
+            void* getMsgA = GetProcAddress(hUser32, "GetMessageA"); // Find GetMessageA.
+            void* dispMsgW = GetProcAddress(hUser32, "DispatchMessageW"); // Find DispatchMessageW.
+            void* dispMsgA = GetProcAddress(hUser32, "DispatchMessageA"); // Find DispatchMessageA.
             
-            void* getAsync = GetProcAddress(hUser32, "GetAsyncKeyState");
-            void* getKey = GetProcAddress(hUser32, "GetKeyState");
-            void* getKbdState = GetProcAddress(hUser32, "GetKeyboardState");
-            void* getCurPos = GetProcAddress(hUser32, "GetCursorPos");
-            void* setCurPos = GetProcAddress(hUser32, "SetCursorPos");
+            void* getAsync = GetProcAddress(hUser32, "GetAsyncKeyState"); // Find asynchronous key state.
+            void* getKey = GetProcAddress(hUser32, "GetKeyState"); // Find synchronous key state.
+            void* getKbdState = GetProcAddress(hUser32, "GetKeyboardState"); // Find full keyboard array reader.
+            void* getCurPos = GetProcAddress(hUser32, "GetCursorPos"); // Find mouse position getter.
+            void* setCurPos = GetProcAddress(hUser32, "SetCursorPos"); // Find mouse position setter.
             
-            if (getRawInput) { if (MH_CreateHook(getRawInput, (LPVOID)&Hook_GetRawInputData, (reinterpret_cast<LPVOID*>(&real_GetRawInputData))) == MH_OK) MH_EnableHook(getRawInput); }
-            if (peekMsgW) { if (MH_CreateHook(peekMsgW, (LPVOID)&Hook_PeekMessageW, (reinterpret_cast<LPVOID*>(&real_PeekMessageW))) == MH_OK) MH_EnableHook(peekMsgW); }
-            if (peekMsgA) { if (MH_CreateHook(peekMsgA, (LPVOID)&Hook_PeekMessageA, (reinterpret_cast<LPVOID*>(&real_PeekMessageA))) == MH_OK) MH_EnableHook(peekMsgA); }
-            if (getMsgW) { if (MH_CreateHook(getMsgW, (LPVOID)&Hook_GetMessageW, (reinterpret_cast<LPVOID*>(&real_GetMessageW))) == MH_OK) MH_EnableHook(getMsgW); }
-            if (getMsgA) { if (MH_CreateHook(getMsgA, (LPVOID)&Hook_GetMessageA, (reinterpret_cast<LPVOID*>(&real_GetMessageA))) == MH_OK) MH_EnableHook(getMsgA); }
-            if (dispMsgW) { if (MH_CreateHook(dispMsgW, (LPVOID)&Hook_DispatchMessageW, (reinterpret_cast<LPVOID*>(&real_DispatchMessageW))) == MH_OK) MH_EnableHook(dispMsgW); }
-            if (dispMsgA) { if (MH_CreateHook(dispMsgA, (LPVOID)&Hook_DispatchMessageA, (reinterpret_cast<LPVOID*>(&real_DispatchMessageA))) == MH_OK) MH_EnableHook(dispMsgA); }
+            if (getRawInput) { if (MH_CreateHook(getRawInput, (LPVOID)&Hook_GetRawInputData, (reinterpret_cast<LPVOID*>(&real_GetRawInputData))) == MH_OK) MH_EnableHook(getRawInput); } // Hook RawInput.
+            if (peekMsgW) { if (MH_CreateHook(peekMsgW, (LPVOID)&Hook_PeekMessageW, (reinterpret_cast<LPVOID*>(&real_PeekMessageW))) == MH_OK) MH_EnableHook(peekMsgW); } // Hook Peek W.
+            if (peekMsgA) { if (MH_CreateHook(peekMsgA, (LPVOID)&Hook_PeekMessageA, (reinterpret_cast<LPVOID*>(&real_PeekMessageA))) == MH_OK) MH_EnableHook(peekMsgA); } // Hook Peek A.
+            if (getMsgW) { if (MH_CreateHook(getMsgW, (LPVOID)&Hook_GetMessageW, (reinterpret_cast<LPVOID*>(&real_GetMessageW))) == MH_OK) MH_EnableHook(getMsgW); } // Hook Get W.
+            if (getMsgA) { if (MH_CreateHook(getMsgA, (LPVOID)&Hook_GetMessageA, (reinterpret_cast<LPVOID*>(&real_GetMessageA))) == MH_OK) MH_EnableHook(getMsgA); } // Hook Get A.
+            if (dispMsgW) { if (MH_CreateHook(dispMsgW, (LPVOID)&Hook_DispatchMessageW, (reinterpret_cast<LPVOID*>(&real_DispatchMessageW))) == MH_OK) MH_EnableHook(dispMsgW); } // Hook Dispatch W.
+            if (dispMsgA) { if (MH_CreateHook(dispMsgA, (LPVOID)&Hook_DispatchMessageA, (reinterpret_cast<LPVOID*>(&real_DispatchMessageA))) == MH_OK) MH_EnableHook(dispMsgA); } // Hook Dispatch A.
             
-            if (getAsync) { if (MH_CreateHook(getAsync, (LPVOID)&Hook_GetAsyncKeyState, (reinterpret_cast<LPVOID*>(&real_GetAsyncKeyState))) == MH_OK) MH_EnableHook(getAsync); }
-            if (getKey) { if (MH_CreateHook(getKey, (LPVOID)&Hook_GetKeyState, (reinterpret_cast<LPVOID*>(&real_GetKeyState))) == MH_OK) MH_EnableHook(getKey); }
-            if (getKbdState) { if (MH_CreateHook(getKbdState, (LPVOID)&Hook_GetKeyboardState, (reinterpret_cast<LPVOID*>(&real_GetKeyboardState))) == MH_OK) MH_EnableHook(getKbdState); }
-            if (getCurPos) { if (MH_CreateHook(getCurPos, (LPVOID)&Hook_GetCursorPos, (reinterpret_cast<LPVOID*>(&real_GetCursorPos))) == MH_OK) MH_EnableHook(getCurPos); }
-            if (setCurPos) { if (MH_CreateHook(setCurPos, (LPVOID)&Hook_SetCursorPos, (reinterpret_cast<LPVOID*>(&real_SetCursorPos))) == MH_OK) MH_EnableHook(setCurPos); }
+            if (getAsync) { if (MH_CreateHook(getAsync, (LPVOID)&Hook_GetAsyncKeyState, (reinterpret_cast<LPVOID*>(&real_GetAsyncKeyState))) == MH_OK) MH_EnableHook(getAsync); } // Hook async key.
+            if (getKey) { if (MH_CreateHook(getKey, (LPVOID)&Hook_GetKeyState, (reinterpret_cast<LPVOID*>(&real_GetKeyState))) == MH_OK) MH_EnableHook(getKey); } // Hook sync key.
+            if (getKbdState) { if (MH_CreateHook(getKbdState, (LPVOID)&Hook_GetKeyboardState, (reinterpret_cast<LPVOID*>(&real_GetKeyboardState))) == MH_OK) MH_EnableHook(getKbdState); } // Hook kb block.
+            if (getCurPos) { if (MH_CreateHook(getCurPos, (LPVOID)&Hook_GetCursorPos, (reinterpret_cast<LPVOID*>(&real_GetCursorPos))) == MH_OK) MH_EnableHook(getCurPos); } // Hook get pos.
+            if (setCurPos) { if (MH_CreateHook(setCurPos, (LPVOID)&Hook_SetCursorPos, (reinterpret_cast<LPVOID*>(&real_SetCursorPos))) == MH_OK) MH_EnableHook(setCurPos); } // Hook set pos.
         }
         
-        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-        if (hKernel32) {
-            void* rf = GetProcAddress(hKernel32, "ReadFile");
-            void* gor = GetProcAddress(hKernel32, "GetOverlappedResult");
-            void* llw = GetProcAddress(hKernel32, "LoadLibraryW");
-            void* llexw = GetProcAddress(hKernel32, "LoadLibraryExW");
-            void* lla = GetProcAddress(hKernel32, "LoadLibraryA");
-            void* llexa = GetProcAddress(hKernel32, "LoadLibraryExA");
-            void* cfa = GetProcAddress(hKernel32, "CreateFileA");
-            void* cfw = GetProcAddress(hKernel32, "CreateFileW");
-            void* cf2 = GetProcAddress(hKernel32, "CreateFile2");
-            void* dio = GetProcAddress(hKernel32, "DeviceIoControl");
-            void* gorex = GetProcAddress(hKernel32, "GetOverlappedResultEx");
+        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll"); // Look up kernel32 for file/loader ops.
+        if (hKernel32) { // Ensure kernel32 exists.
+            void* rf = GetProcAddress(hKernel32, "ReadFile"); // Find ReadFile.
+            void* gor = GetProcAddress(hKernel32, "GetOverlappedResult"); // Find GetOverlappedResult.
+            void* llw = GetProcAddress(hKernel32, "LoadLibraryW"); // Find LoadLibraryW.
+            void* llexw = GetProcAddress(hKernel32, "LoadLibraryExW"); // Find LoadLibraryExW.
+            void* lla = GetProcAddress(hKernel32, "LoadLibraryA"); // Find LoadLibraryA.
+            void* llexa = GetProcAddress(hKernel32, "LoadLibraryExA"); // Find LoadLibraryExA.
+            void* cfa = GetProcAddress(hKernel32, "CreateFileA"); // Find CreateFileA.
+            void* cfw = GetProcAddress(hKernel32, "CreateFileW"); // Find CreateFileW.
+            void* cf2 = GetProcAddress(hKernel32, "CreateFile2"); // Find CreateFile2.
+            void* dio = GetProcAddress(hKernel32, "DeviceIoControl"); // Find DeviceIoControl.
+            void* gorex = GetProcAddress(hKernel32, "GetOverlappedResultEx"); // Find GetOverlappedResultEx.
+            void* ch = GetProcAddress(hKernel32, "CloseHandle"); // Find CloseHandle.
             
-            if (rf) { if (MH_CreateHook(rf, (LPVOID)&Hook_ReadFile, (reinterpret_cast<LPVOID*>(&real_ReadFile))) == MH_OK) MH_EnableHook(rf); }
-            if (gor) { if (MH_CreateHook(gor, (LPVOID)&Hook_GetOverlappedResult, (reinterpret_cast<LPVOID*>(&real_GetOverlappedResult))) == MH_OK) MH_EnableHook(gor); }
-            if (llw) { if (MH_CreateHook(llw, (LPVOID)&Hook_LoadLibraryW, (reinterpret_cast<LPVOID*>(&real_LoadLibraryW))) == MH_OK) MH_EnableHook(llw); }
-            if (llexw) { if (MH_CreateHook(llexw, (LPVOID)&Hook_LoadLibraryExW, (reinterpret_cast<LPVOID*>(&real_LoadLibraryExW))) == MH_OK) MH_EnableHook(llexw); }
-            if (lla) { if (MH_CreateHook(lla, (LPVOID)&Hook_LoadLibraryA, (reinterpret_cast<LPVOID*>(&real_LoadLibraryA))) == MH_OK) MH_EnableHook(lla); }
-            if (llexa) { if (MH_CreateHook(llexa, (LPVOID)&Hook_LoadLibraryExA, (reinterpret_cast<LPVOID*>(&real_LoadLibraryExA))) == MH_OK) MH_EnableHook(llexa); }
-            if (cfa) { if (MH_CreateHook(cfa, (LPVOID)&Hook_CreateFileA, (reinterpret_cast<LPVOID*>(&real_CreateFileA))) == MH_OK) MH_EnableHook(cfa); }
-            if (cfw) { if (MH_CreateHook(cfw, (LPVOID)&Hook_CreateFileW, (reinterpret_cast<LPVOID*>(&real_CreateFileW))) == MH_OK) MH_EnableHook(cfw); }
-            if (cf2) { if (MH_CreateHook(cf2, (LPVOID)&Hook_CreateFile2, (reinterpret_cast<LPVOID*>(&real_CreateFile2))) == MH_OK) MH_EnableHook(cf2); }
-            if (dio) { if (MH_CreateHook(dio, (LPVOID)&Hook_DeviceIoControl, (reinterpret_cast<LPVOID*>(&real_DeviceIoControl))) == MH_OK) MH_EnableHook(dio); }
-            if (gorex) { if (MH_CreateHook(gorex, (LPVOID)&Hook_GetOverlappedResultEx, (reinterpret_cast<LPVOID*>(&real_GetOverlappedResultEx))) == MH_OK) MH_EnableHook(gorex); }
+            if (rf) { if (MH_CreateHook(rf, (LPVOID)&Hook_ReadFile, (reinterpret_cast<LPVOID*>(&real_ReadFile))) == MH_OK) MH_EnableHook(rf); } // Hook ReadFile.
+            if (ch) { if (MH_CreateHook(ch, (LPVOID)&Hook_CloseHandle, (reinterpret_cast<LPVOID*>(&real_CloseHandle))) == MH_OK) MH_EnableHook(ch); } // Hook CloseHandle.
+            if (gor) { if (MH_CreateHook(gor, (LPVOID)&Hook_GetOverlappedResult, (reinterpret_cast<LPVOID*>(&real_GetOverlappedResult))) == MH_OK) MH_EnableHook(gor); } // Hook GetOverlappedResult.
+            if (llw) { if (MH_CreateHook(llw, (LPVOID)&Hook_LoadLibraryW, (reinterpret_cast<LPVOID*>(&real_LoadLibraryW))) == MH_OK) MH_EnableHook(llw); } // Hook LoadLibW.
+            if (llexw) { if (MH_CreateHook(llexw, (LPVOID)&Hook_LoadLibraryExW, (reinterpret_cast<LPVOID*>(&real_LoadLibraryExW))) == MH_OK) MH_EnableHook(llexw); } // Hook LoadLibExW.
+            if (lla) { if (MH_CreateHook(lla, (LPVOID)&Hook_LoadLibraryA, (reinterpret_cast<LPVOID*>(&real_LoadLibraryA))) == MH_OK) MH_EnableHook(lla); } // Hook LoadLibA.
+            if (llexa) { if (MH_CreateHook(llexa, (LPVOID)&Hook_LoadLibraryExA, (reinterpret_cast<LPVOID*>(&real_LoadLibraryExA))) == MH_OK) MH_EnableHook(llexa); } // Hook LoadLibExA.
+            if (cfa) { if (MH_CreateHook(cfa, (LPVOID)&Hook_CreateFileA, (reinterpret_cast<LPVOID*>(&real_CreateFileA))) == MH_OK) MH_EnableHook(cfa); } // Hook CreateFileA.
+            if (cfw) { if (MH_CreateHook(cfw, (LPVOID)&Hook_CreateFileW, (reinterpret_cast<LPVOID*>(&real_CreateFileW))) == MH_OK) MH_EnableHook(cfw); } // Hook CreateFileW.
+            if (cf2) { if (MH_CreateHook(cf2, (LPVOID)&Hook_CreateFile2, (reinterpret_cast<LPVOID*>(&real_CreateFile2))) == MH_OK) MH_EnableHook(cf2); } // Hook CreateFile2.
+            if (dio) { if (MH_CreateHook(dio, (LPVOID)&Hook_DeviceIoControl, (reinterpret_cast<LPVOID*>(&real_DeviceIoControl))) == MH_OK) MH_EnableHook(dio); } // Hook DeviceIoControl.
+            if (gorex) { if (MH_CreateHook(gorex, (LPVOID)&Hook_GetOverlappedResultEx, (reinterpret_cast<LPVOID*>(&real_GetOverlappedResultEx))) == MH_OK) MH_EnableHook(gorex); } // Hook GetOverlappedResultEx.
         }
         
-        HMODULE hCombase = GetModuleHandleA("combase.dll");
-        if (hCombase) {
-            void* roGet = GetProcAddress(hCombase, "RoGetActivationFactory");
-            ptr_WindowsGetStringRawBuffer = (WindowsGetStringRawBuffer_t)GetProcAddress(hCombase, "WindowsGetStringRawBuffer");
-            if (roGet && ptr_WindowsGetStringRawBuffer) {
-                if (MH_CreateHook(roGet, (LPVOID)&Hook_RoGetActivationFactory, (reinterpret_cast<LPVOID*>(&real_RoGetActivationFactory))) == MH_OK) MH_EnableHook(roGet);
+        HMODULE hCombase = GetModuleHandleA("combase.dll"); // Look up combase for WinRT hooking.
+        if (hCombase) { // Ensure combase exists.
+            void* roGet = GetProcAddress(hCombase, "RoGetActivationFactory"); // Find WinRT factory instantiator.
+            ptr_WindowsGetStringRawBuffer = (WindowsGetStringRawBuffer_t)GetProcAddress(hCombase, "WindowsGetStringRawBuffer"); // Find string extractor.
+            if (roGet && ptr_WindowsGetStringRawBuffer) { // Validate pointers.
+                if (MH_CreateHook(roGet, (LPVOID)&Hook_RoGetActivationFactory, (reinterpret_cast<LPVOID*>(&real_RoGetActivationFactory))) == MH_OK) MH_EnableHook(roGet); // Hook factory.
             }
         }
         
-        HANDLE hThread = CreateThread(NULL, 0, BackgroundWorker, NULL, 0, NULL);
-        if (hThread) CloseHandle(hThread);
+        HANDLE hThread = CreateThread(NULL, 0, BackgroundWorker, NULL, 0, NULL); // Kick off the background watchdog thread.
+        if (hThread) CloseHandle(hThread); // Close the handle to the thread as we don't need to join/wait on it.
     }
-    return TRUE;
+    return TRUE; // Tell the OS the DLL initialized flawlessly.
 }
 
 
