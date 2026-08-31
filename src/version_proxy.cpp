@@ -18,6 +18,21 @@
 #pragma intrinsic(_ReturnAddress) // Force compiler to use intrinsic version of _ReturnAddress.
 
 #include "version_pointers.h"
+enum class ControllerType { Unknown = 0, DualSense = 1, DualShock4 = 2 };
+
+// Hardware Identification Constants
+#define SONY_VID_W L"vid_054c"
+#define DUALSENSE_PID_1_W L"pid_0ce6"
+#define DUALSENSE_EDGE_PID_W L"pid_0df2"
+#define DS4_PID_1_W L"pid_05c4"
+#define DS4_PID_2_W L"pid_09cc"
+
+#define SONY_VID_A "vid_054c"
+#define DUALSENSE_PID_1_A "pid_0ce6"
+#define DUALSENSE_EDGE_PID_A "pid_0df2"
+#define DS4_PID_1_A "pid_05c4"
+#define DS4_PID_2_A "pid_09cc"
+
 
 
 // Steamworks SDK Minimal Header
@@ -113,6 +128,44 @@ std::once_flag g_SteamInitOnceFlag; // Once-flag to ensure the listener is initi
 void NeutralizeDualSensePacket(PBYTE buf, DWORD size); // Forward declaration of function to neutralize DualSense packets.
 // Constructs a flawless hardware spoof that explicitly sets the Touchpad to "Not Touching",
 // neutralizes all sticks and buttons, and provides proper IMU data to prevent NaN math.
+void SynthesizeNeutralDualShock4Packet(PBYTE buf, DWORD size) { // Function to zero out or neutralize DualShock 4 input.
+    if (!buf || size < 64) return; // If buffer is invalid or too small, abort synthesis.
+    memset(buf, 0, size); // Clear the entire buffer to zeroes.
+    
+    // USB Report ID
+    buf[0] = 0x01; // Set the report ID to 1.
+    
+    // Set joysticks to mechanical center (128). 
+    buf[1] = 0x80; buf[2] = 0x80; buf[3] = 0x80; buf[4] = 0x80; // Assign 128 (0x80) to both X and Y axes of both sticks.
+    
+    // DS4 expects triggers at buf[8] and buf[9], and buttons/D-pad at buf[5]. 0x08 is neutral D-pad.
+    buf[5] = 0x08; // Set D-Pad to neutral position.
+    buf[6] = 0x00; // Clear buttons.
+    buf[7] = 0x00; // Clear system/special buttons.
+    buf[8] = 0x00; // Left trigger.
+    buf[9] = 0x00; // Right trigger.
+    
+    // IMU (Gravity)
+    // 1G gravity on Z axis to prevent camera NaN snapping. DS4 expects this at bytes 23-24.
+    if (size >= 25) {
+        buf[23] = 0x00; // Accelerometer Z LSB.
+        buf[24] = 0x20; // 0x2000 = 8192 in little endian. Accelerometer Z MSB.
+    }
+    
+    // Touchpad 1 data.
+    if (size >= 40) { // Check if buffer includes touchpad data.
+        // We set the MSB (0x80) to indicate the finger is NOT touching the pad.
+        buf[36] = 0x80; 
+        
+        // As a fallback for lazy parsers that ignore the "Not Touching" bit,
+        // we explicitly set the coordinate to the physical center of the pad (960x471)
+        // instead of leaving it at 0,0 (Top-Left) which could cause UI glitches.
+        buf[37] = 0xC0; // X Low
+        buf[38] = 0x73; // X High + Y Low
+        buf[39] = 0x1D; // Y High
+    }
+}
+
 void SynthesizeNeutralDualSensePacket(PBYTE buf, DWORD size) { // Function to zero out or neutralize DualSense input.
     if (!buf || size < 64) return; // If buffer is invalid or too small, abort synthesis.
     memset(buf, 0, size); // Clear the entire buffer to zeroes.
@@ -221,19 +274,20 @@ XInputGetStateEx_t real_XInputGetStateEx = nullptr; // Function pointer to store
 // ============================================================================
 
 
-#include <unordered_set>
+#include <unordered_map>
 #include <shared_mutex>
-std::unordered_set<HANDLE> g_RawInputSonyHandles; // Set tracking handles known to be Sony controllers.
-std::unordered_set<HANDLE> g_RawInputNonSonyHandles; // Set tracking handles known NOT to be Sony controllers.
+std::unordered_map<HANDLE, ControllerType> g_RawInputSonyHandles; // Map tracking handles known to be Sony controllers.
+std::unordered_map<HANDLE, bool> g_RawInputNonSonyHandles; // Map tracking handles known NOT to be Sony controllers.
 std::shared_mutex g_RawInputMutex; // Mutex protecting the raw input handle sets.
 
-bool IsRawInputSony(HANDLE hDevice) { // Function to determine if a raw input device is a Sony controller.
-    if (!hDevice) return false; // If the device handle is null, it's not a valid device.
+ControllerType GetRawInputSonyType(HANDLE hDevice) { // Function to determine if a raw input device is a Sony controller.
+    if (!hDevice) return ControllerType::Unknown; // If the device handle is null, it's not a valid device.
     
     { // Create a scope for the reader lock.
         std::shared_lock<std::shared_mutex> lock(g_RawInputMutex); // Acquire a shared lock for reading.
-        if (g_RawInputSonyHandles.find(hDevice) != g_RawInputSonyHandles.end()) return true; // If found in Sony set, return true.
-        if (g_RawInputNonSonyHandles.find(hDevice) != g_RawInputNonSonyHandles.end()) return false; // If found in non-Sony set, return false.
+        auto it = g_RawInputSonyHandles.find(hDevice);
+        if (it != g_RawInputSonyHandles.end()) return it->second; // If found in Sony set, return the type.
+        if (g_RawInputNonSonyHandles.find(hDevice) != g_RawInputNonSonyHandles.end()) return ControllerType::Unknown; // If found in non-Sony set, return unknown.
     } // Release shared lock.
     
     UINT size = 0; // Variable to hold the size of the device name.
@@ -245,16 +299,24 @@ bool IsRawInputSony(HANDLE hDevice) { // Function to determine if a raw input de
             for (auto& c : s) c = tolower(c); // Convert the entire string to lowercase for case-insensitive matching.
             
             std::unique_lock<std::shared_mutex> lock(g_RawInputMutex); // Acquire an exclusive lock to update caches.
-            if (s.find("vid_054c") != std::string::npos) { // Check if the device name contains Sony's Vendor ID.
-                g_RawInputSonyHandles.insert(hDevice); // Add to known Sony handles.
-                return true; // Return true as it's a Sony device.
-            } else { // Otherwise, it's not a Sony device.
-                g_RawInputNonSonyHandles.insert(hDevice); // Add to known non-Sony handles.
-                return false; // Return false.
+            if (s.find(SONY_VID_A) != std::string::npos) { // Check if the device name contains Sony's Vendor ID.
+                ControllerType type = ControllerType::Unknown;
+                if (s.find(DS4_PID_1_A) != std::string::npos || s.find(DS4_PID_2_A) != std::string::npos) {
+                    type = ControllerType::DualShock4;
+                } else if (s.find(DUALSENSE_PID_1_A) != std::string::npos || s.find(DUALSENSE_EDGE_PID_A) != std::string::npos) {
+                    type = ControllerType::DualSense;
+                }
+                
+                if (type != ControllerType::Unknown) {
+                    g_RawInputSonyHandles[hDevice] = type; // Add to known Sony handles.
+                    return type; // Return the type as it's a known Sony device.
+                }
             }
+            g_RawInputNonSonyHandles[hDevice] = true; // Add to known non-Sony handles.
+            return ControllerType::Unknown; // Return unknown.
         }
     }
-    return false; // Default to false if we couldn't determine the device type.
+    return ControllerType::Unknown; // Default to unknown if we couldn't determine the device type.
 }
 
 UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize, UINT cbSizeHeader) { // Intercept GetRawInputData calls.
@@ -263,8 +325,13 @@ UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pDa
         RAWINPUT* raw = (RAWINPUT*)pData; // Cast the raw data to a RAWINPUT structure.
         if (raw->header.dwType == RIM_TYPEHID) { // Verify this is a Human Interface Device report.
             DWORD reportSize = raw->data.hid.dwSizeHid * raw->data.hid.dwCount; // Calculate the total byte size of the HID report.
-            if ((reportSize == 64 || reportSize == 78) && IsRawInputSony(raw->header.hDevice)) { // DualSense reports are usually 64 or 78 bytes. Check size and Sony vendor.
-                SynthesizeNeutralDualSensePacket((PBYTE)raw->data.hid.bRawData, reportSize); // Overwrite the report with a neutral (zero-state) packet.
+            ControllerType type = GetRawInputSonyType(raw->header.hDevice);
+            if ((reportSize == 64 || reportSize == 78) && type != ControllerType::Unknown) { // DualSense reports are usually 64 or 78 bytes. Check size and Sony vendor.
+                if (type == ControllerType::DualSense) {
+                    SynthesizeNeutralDualSensePacket((PBYTE)raw->data.hid.bRawData, reportSize); // Overwrite the report with a neutral (zero-state) packet.
+                } else if (type == ControllerType::DualShock4) {
+                    SynthesizeNeutralDualShock4Packet((PBYTE)raw->data.hid.bRawData, reportSize); // Overwrite the report with a neutral DS4 packet.
+                }
             }
         }
     }
@@ -276,9 +343,26 @@ UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pDa
 // Purpose: Block synthesized Desktop Configuration inputs from Steam
 // ============================================================================
 
+// Listens for PnP (Plug and Play) device removal broadcasts from the Windows kernel.
+// Because RawInput device handles are not closed via CloseHandle(), the OS can aggressively 
+// recycle internal handle IDs when a user hot-swaps controllers. By purging the handles 
+// immediately upon physical disconnect, we prevent the proxy from misidentifying a new Xbox 
+// controller as an old disconnected DualShock 4 due to handle ID recycling.
+void HandleDeviceChangeMessage(LPMSG lpMsg) {
+    if (lpMsg && lpMsg->message == 0x00FE) { // 0x00FE is WM_INPUT_DEVICE_CHANGE, fired by the OS on hot-plug events.
+        if (lpMsg->wParam == 2) { // 2 corresponds to GIDC_REMOVAL, meaning the hardware was physically disconnected.
+            HANDLE hDevice = (HANDLE)lpMsg->lParam; // The lParam explicitly holds the internal RawInput handle of the dropped device.
+            std::unique_lock<std::shared_mutex> lock(g_RawInputMutex); // Acquire exclusive write lock to safely modify our internal tracking maps.
+            g_RawInputSonyHandles.erase(hDevice); // Purge the handle from the Sony controller cache so it cannot be falsely reused.
+            g_RawInputNonSonyHandles.erase(hDevice); // Purge the handle from the non-Sony blacklist cache.
+        }
+    }
+}
+
 // Prevent Steam's global "Desktop Configuration" from synthesizing fake Windows Keyboard events
 // when the overlay is active.
 void NullifyMessage(LPMSG lpMsg) { // Function to zero out Windows messages if blocking is active.
+ // Function to zero out Windows messages if blocking is active.
     if (lpMsg && ShouldBlockInput()) { // Check if the message pointer is valid and input should be blocked.
         if ((lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || // Check if it's a keyboard message.
             (lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || // Check if it's a mouse message.
@@ -292,7 +376,7 @@ typedef BOOL (WINAPI *PeekMessageW_t)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin
 PeekMessageW_t real_PeekMessageW = nullptr; // Store the original PeekMessageW pointer.
 BOOL WINAPI Hook_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) { // Intercept PeekMessageW.
     BOOL result = real_PeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg); // Call the original PeekMessageW.
-    if (result) NullifyMessage(lpMsg); // If a message was retrieved, try to nullify it if necessary.
+    if (result) { HandleDeviceChangeMessage(lpMsg); NullifyMessage(lpMsg); } // If a message was retrieved, try to nullify it if necessary.
     return result; // Return the result of PeekMessageW.
 }
 
@@ -300,7 +384,7 @@ typedef BOOL (WINAPI *PeekMessageA_t)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin
 PeekMessageA_t real_PeekMessageA = nullptr; // Store the original PeekMessageA pointer.
 BOOL WINAPI Hook_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) { // Intercept PeekMessageA.
     BOOL result = real_PeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg); // Call original PeekMessageA.
-    if (result) NullifyMessage(lpMsg); // Check if a message was retrieved, then nullify it if necessary.
+    if (result) { HandleDeviceChangeMessage(lpMsg); NullifyMessage(lpMsg); } // Check if a message was retrieved, then nullify it if necessary.
     return result; // Return the potentially modified result.
 }
 
@@ -308,7 +392,7 @@ typedef BOOL (WINAPI *GetMessageW_t)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin,
 GetMessageW_t real_GetMessageW = nullptr; // Store the original GetMessageW pointer.
 BOOL WINAPI Hook_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) { // Intercept GetMessageW.
     BOOL result = real_GetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax); // Call original GetMessageW.
-    if (result != -1 && result != 0) NullifyMessage(lpMsg); // If we successfully got a message (not an error or WM_QUIT), nullify it if necessary.
+    if (result != -1 && result != 0) { HandleDeviceChangeMessage(lpMsg); NullifyMessage(lpMsg); } // If we successfully got a message (not an error or WM_QUIT), nullify it if necessary.
     return result; // Return the potentially modified result.
 }
 
@@ -316,7 +400,7 @@ typedef BOOL (WINAPI *GetMessageA_t)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin,
 GetMessageA_t real_GetMessageA = nullptr; // Store the original GetMessageA pointer.
 BOOL WINAPI Hook_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) { // Intercept GetMessageA.
     BOOL result = real_GetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax); // Call original GetMessageA.
-    if (result != -1 && result != 0) NullifyMessage(lpMsg); // Check if a message was retrieved successfully and nullify it if needed.
+    if (result != -1 && result != 0) { HandleDeviceChangeMessage(lpMsg); NullifyMessage(lpMsg); } // Check if a message was retrieved successfully and nullify it if needed.
     return result; // Return the potentially modified result.
 }
 
@@ -655,10 +739,11 @@ DWORD WINAPI BackgroundWorker(LPVOID lpParam) { // The main background thread en
 // ============================================================================
 // FILE IO AND HID CREATION INTERCEPTORS
 // ============================================================================
-#include <unordered_set>
+#include <unordered_map>
 #include <shared_mutex>
 
-std::unordered_set<HANDLE> g_HidHandles; // Set to store OS handles identified as HID devices.
+
+std::unordered_map<HANDLE, ControllerType> g_HidHandles;
 std::shared_mutex g_HidMutex; // Mutex to synchronize access to the HID handle set.
 
 // Require hardware path to match specific DualSense/DualShock PIDs to avoid corrupting Sony TV/Headset media streams.
@@ -668,11 +753,17 @@ void RegisterHidHandle(HANDLE h, LPCWSTR name) {
     if (h != INVALID_HANDLE_VALUE && name) { // Ensure handle is valid and name pointer is valid.
         std::wstring s(name); // Copy name to wide string.
         for (auto& c : s) c = towlower(c); // Convert entire string to lowercase for case-insensitive matching.
-        if (s.find(L"vid_054c") != std::wstring::npos && // Check if name contains Sony Vendor ID.
-            (s.find(L"pid_0ce6") != std::wstring::npos || s.find(L"pid_0df2") != std::wstring::npos || // Check for DualSense/DualSense Edge PIDs.
-             s.find(L"pid_05c4") != std::wstring::npos || s.find(L"pid_09cc") != std::wstring::npos)) { // Check for DualShock 4 PIDs.
-            std::unique_lock<std::shared_mutex> lock(g_HidMutex); // Acquire exclusive lock to update the shared set.
-            g_HidHandles.insert(h); // Add handle to our tracked HID set.
+        if (s.find(SONY_VID_W) != std::wstring::npos) { // Check if name contains Sony Vendor ID.
+            ControllerType type = ControllerType::Unknown; // 0 = Unknown
+            if (s.find(DS4_PID_1_W) != std::wstring::npos || s.find(DS4_PID_2_W) != std::wstring::npos) {
+                type = ControllerType::DualShock4; // DualShock 4
+            } else if (s.find(DUALSENSE_PID_1_W) != std::wstring::npos || s.find(DUALSENSE_EDGE_PID_W) != std::wstring::npos) {
+                type = ControllerType::DualSense; // DualSense
+            }
+            if (type != ControllerType::Unknown) { // If it's a known controller type.
+                std::unique_lock<std::shared_mutex> lock(g_HidMutex); // Acquire exclusive lock to update the shared map.
+                g_HidHandles[h] = type; // Add handle to our tracked HID map.
+            }
         }
     }
 }
@@ -683,20 +774,28 @@ void RegisterHidHandleA(HANDLE h, LPCSTR name) {
     if (h != INVALID_HANDLE_VALUE && name) { // Ensure handle is valid and name pointer is valid.
         std::string s(name); // Copy name to string.
         for (auto& c : s) c = tolower(c); // Convert to lowercase.
-        if (s.find("vid_054c") != std::string::npos && // Check for Sony Vendor ID.
-            (s.find("pid_0ce6") != std::string::npos || s.find("pid_0df2") != std::string::npos || // Check for DualSense PIDs.
-             s.find("pid_05c4") != std::string::npos || s.find("pid_09cc") != std::string::npos)) { // Check for DualShock PIDs.
-            std::unique_lock<std::shared_mutex> lock(g_HidMutex); // Acquire exclusive lock.
-            g_HidHandles.insert(h); // Add handle to tracked set.
+        if (s.find(SONY_VID_A) != std::string::npos) { // Check for Sony Vendor ID.
+            ControllerType type = ControllerType::Unknown; // 0 = Unknown
+            if (s.find(DS4_PID_1_A) != std::string::npos || s.find(DS4_PID_2_A) != std::string::npos) {
+                type = ControllerType::DualShock4; // DualShock 4
+            } else if (s.find(DUALSENSE_PID_1_A) != std::string::npos || s.find(DUALSENSE_EDGE_PID_A) != std::string::npos) {
+                type = ControllerType::DualSense; // DualSense
+            }
+            if (type != ControllerType::Unknown) { // If it's a known controller type.
+                std::unique_lock<std::shared_mutex> lock(g_HidMutex); // Acquire exclusive lock.
+                g_HidHandles[h] = type; // Add handle to tracked map.
+            }
         }
     }
 }
 
 // Fast, thread-safe lookup used by ReadFile and DeviceIoControl to verify if the file stream 
-// currently being accessed belongs to a DualSense controller rather than a media file.
-bool IsHidHandle(HANDLE h) {
+// currently being accessed belongs to a DualSense/DS4 controller rather than a media file.
+ControllerType GetHidHandleType(HANDLE h) {
     std::shared_lock<std::shared_mutex> lock(g_HidMutex); // Acquire shared read lock.
-    return g_HidHandles.find(h) != g_HidHandles.end(); // Return true if the handle exists in our set.
+    auto it = g_HidHandles.find(h); // Look up the handle in the map.
+    if (it != g_HidHandles.end()) return it->second; // Return the controller type (1 or 2).
+    return ControllerType::Unknown; // Return Unknown if not found.
 }
 
 typedef HANDLE (WINAPI *CreateFileW_t)(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
@@ -753,17 +852,24 @@ typedef BOOL (WINAPI *DeviceIoControl_t)(HANDLE hDevice, DWORD dwIoControlCode, 
 DeviceIoControl_t real_DeviceIoControl = nullptr;
 // Returning TRUE without error prevents USB drop and avoids UE5's IOCP completely bypassing GetOverlappedResult.
 BOOL WINAPI Hook_DeviceIoControl(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped) {
-    if (ShouldBlockInput() && IsHidHandle(hDevice)) { // If we should block input AND this request targets a known Sony HID handle.
-        if (lpOutBuffer && nOutBufferSize >= 64) { // Verify the output buffer is large enough for a DualSense report.
-            SynthesizeNeutralDualSensePacket((PBYTE)lpOutBuffer, nOutBufferSize); // Write a completely neutral (centered/unpressed) report.
+    if (ShouldBlockInput()) {
+        ControllerType type = GetHidHandleType(hDevice);
+        if (type != ControllerType::Unknown) { // If we should block input AND this request targets a known Sony HID handle.
+            if (lpOutBuffer && nOutBufferSize >= 64) { // Verify the output buffer is large enough for a report.
+                if (type == ControllerType::DualSense) {
+                    SynthesizeNeutralDualSensePacket((PBYTE)lpOutBuffer, nOutBufferSize); // Write a completely neutral DualSense report.
+                } else if (type == ControllerType::DualShock4) {
+                    SynthesizeNeutralDualShock4Packet((PBYTE)lpOutBuffer, nOutBufferSize); // Write a completely neutral DS4 report.
+                }
+            }
+            if (lpBytesReturned) *lpBytesReturned = nOutBufferSize >= 64 ? 64 : nOutBufferSize; // Fake the number of bytes returned.
+            if (lpOverlapped) { // If an asynchronous OVERLAPPED structure was provided.
+                lpOverlapped->Internal = 0; // Set internal status to success (0).
+                lpOverlapped->InternalHigh = nOutBufferSize >= 64 ? 64 : nOutBufferSize; // Set bytes transferred.
+                if (lpOverlapped->hEvent) SetEvent(lpOverlapped->hEvent); // Manually signal the completion event so the game's IOCP wait wakes up.
+            }
+            return TRUE; // Return success (prevent error reporting to game).
         }
-        if (lpBytesReturned) *lpBytesReturned = nOutBufferSize >= 64 ? 64 : nOutBufferSize; // Fake the number of bytes returned.
-        if (lpOverlapped) { // If an asynchronous OVERLAPPED structure was provided.
-            lpOverlapped->Internal = 0; // Set internal status to success (0).
-            lpOverlapped->InternalHigh = nOutBufferSize >= 64 ? 64 : nOutBufferSize; // Set bytes transferred.
-            if (lpOverlapped->hEvent) SetEvent(lpOverlapped->hEvent); // Manually signal the completion event so the game's IOCP wait wakes up.
-        }
-        return TRUE; // Return success (prevent error reporting to game).
     }
     return real_DeviceIoControl(hDevice, dwIoControlCode, lpInBuffer, nInBufferSize, lpOutBuffer, nOutBufferSize, lpBytesReturned, lpOverlapped); // Call original DeviceIoControl.
 }
@@ -771,18 +877,25 @@ BOOL WINAPI Hook_DeviceIoControl(HANDLE hDevice, DWORD dwIoControlCode, LPVOID l
 typedef BOOL (WINAPI *ReadFile_t)(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped);
 ReadFile_t real_ReadFile = nullptr;
 BOOL WINAPI Hook_ReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped) {
-    if (ShouldBlockInput() && IsHidHandle(hFile)) { // Check if we are blocking input and the handle is a tracked Sony controller.
-        if (lpBuffer && nNumberOfBytesToRead >= 64) { // Check if buffer is large enough.
-            SynthesizeNeutralDualSensePacket((PBYTE)lpBuffer, nNumberOfBytesToRead); // Write neutral inputs to the buffer directly.
+    if (ShouldBlockInput()) { // Check if we are blocking input.
+        ControllerType type = GetHidHandleType(hFile); // Check if the handle is a tracked Sony controller.
+        if (type != ControllerType::Unknown) {
+            if (lpBuffer && nNumberOfBytesToRead >= 64) { // Check if buffer is large enough.
+                if (type == ControllerType::DualSense) {
+                    SynthesizeNeutralDualSensePacket((PBYTE)lpBuffer, nNumberOfBytesToRead); // Write neutral DualSense inputs to the buffer directly.
+                } else if (type == ControllerType::DualShock4) {
+                    SynthesizeNeutralDualShock4Packet((PBYTE)lpBuffer, nNumberOfBytesToRead); // Write neutral DS4 inputs to the buffer directly.
+                }
+            }
+            DWORD bytesRead = nNumberOfBytesToRead >= 64 ? 64 : nNumberOfBytesToRead; // Determine bytes read to report.
+            if (lpNumberOfBytesRead) *lpNumberOfBytesRead = bytesRead; // Set the synchronous out-parameter.
+            if (lpOverlapped) { // Check for async IO structure.
+                lpOverlapped->Internal = 0; // Mark operation as successful.
+                lpOverlapped->InternalHigh = bytesRead; // Mark bytes transferred.
+                if (lpOverlapped->hEvent) SetEvent(lpOverlapped->hEvent); // Signal completion event.
+            }
+            return TRUE; // Return true to indicate immediate success.
         }
-        DWORD bytesRead = nNumberOfBytesToRead >= 64 ? 64 : nNumberOfBytesToRead; // Determine bytes read to report.
-        if (lpNumberOfBytesRead) *lpNumberOfBytesRead = bytesRead; // Set the synchronous out-parameter.
-        if (lpOverlapped) { // Check for async IO structure.
-            lpOverlapped->Internal = 0; // Mark operation as successful.
-            lpOverlapped->InternalHigh = bytesRead; // Mark bytes transferred.
-            if (lpOverlapped->hEvent) SetEvent(lpOverlapped->hEvent); // Signal completion event.
-        }
-        return TRUE; // Return true to indicate immediate success.
     }
     return real_ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped); // Otherwise, fall back to the real ReadFile.
 }
@@ -790,7 +903,7 @@ BOOL WINAPI Hook_ReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToR
 typedef BOOL (WINAPI *GetOverlappedResult_t)(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, BOOL bWait);
 GetOverlappedResult_t real_GetOverlappedResult = nullptr;
 BOOL WINAPI Hook_GetOverlappedResult(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, BOOL bWait) {
-    if (ShouldBlockInput() && IsHidHandle(hFile)) { // Check if we should override.
+    if (ShouldBlockInput() && GetHidHandleType(hFile) != ControllerType::Unknown) { // Check if we should override.
         if (lpNumberOfBytesTransferred) *lpNumberOfBytesTransferred = 64; // Pretend we transferred a full packet.
         return TRUE; // Say the async op completed successfully.
     }
@@ -800,7 +913,7 @@ BOOL WINAPI Hook_GetOverlappedResult(HANDLE hFile, LPOVERLAPPED lpOverlapped, LP
 typedef BOOL (WINAPI *GetOverlappedResultEx_t)(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, DWORD dwMilliseconds, BOOL bAlertable);
 GetOverlappedResultEx_t real_GetOverlappedResultEx = nullptr;
 BOOL WINAPI Hook_GetOverlappedResultEx(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, DWORD dwMilliseconds, BOOL bAlertable) {
-    if (ShouldBlockInput() && IsHidHandle(hFile)) { // Check if we should override.
+    if (ShouldBlockInput() && GetHidHandleType(hFile) != ControllerType::Unknown) { // Check if we should override.
         if (lpNumberOfBytesTransferred) *lpNumberOfBytesTransferred = 64; // Return faked bytes transferred count.
         return TRUE; // Return success immediately.
     }
